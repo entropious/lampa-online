@@ -1326,13 +1326,29 @@
                 seasons = links.map(function (item) { return { title: item.text, url: item.url }; });
                 updateFilter();
 
-                var saved = sourceChoice().season;
-                var season = seasons.filter(function (s) { return s.title === saved; })[0] || seasons[0];
-
-                return request(season.url);
+                return request(currentSeason().url);
             }
 
             doesNotAnswer();
+        }
+
+        // Сезон, который открыть: выбранный здесь раньше, иначе тот, где
+        // человек смотрел последнюю серию, иначе первый настоящий. У аниме
+        // балансеры первым ставят «0 сезон» — спецвыпуски, открывать его по
+        // умолчанию значит показать не то.
+        function seasonNumber(title) {
+            var match = String(title || '').match(/^\s*(\d+)/);
+            return match ? parseInt(match[1], 10) : null;
+        }
+
+        function currentSeason() {
+            var saved = sourceChoice().season;
+            var watched = (loadChoice().last || {}).season;
+
+            return seasons.filter(function (s) { return saved && s.title === saved; })[0] ||
+                seasons.filter(function (s) { return watched && seasonNumber(s.title) === watched; })[0] ||
+                seasons.filter(function (s) { return seasonNumber(s.title) !== 0; })[0] ||
+                seasons[0];
         }
 
         // Балансер открывается на своей озвучке по умолчанию. Если человек
@@ -1907,7 +1923,6 @@
             var chosen = [];
 
             var voice_active = voices.filter(function (v) { return v.active; })[0];
-            var season_title = choice.season;
 
             if (voices.length) {
                 items.push({
@@ -1923,7 +1938,7 @@
             }
 
             if (seasons.length) {
-                var current = seasons.filter(function (s) { return s.title === season_title; })[0] || seasons[0];
+                var current = currentSeason();
 
                 items.push({
                     title: 'Сезон',
