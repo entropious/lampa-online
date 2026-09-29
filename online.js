@@ -1755,6 +1755,10 @@
             };
         }
 
+        function external() {
+            return Lampa.Storage.field('player') !== 'inner';
+        }
+
         function play(element, videos) {
             resolve(element, function (stream) {
                 if (!stream || !stream.url) return Lampa.Noty.show('Балансер не отдал ссылку на видео');
@@ -1764,8 +1768,17 @@
 
                 if (serial) {
                     videos.forEach(function (other) {
-                        if (other === element) return playlist.push(first);
+                        // В плейлист — копия, а не сам first: ему ниже
+                        // достанется ссылка на плейлист, и получится кольцо.
+                        // Внешний плеер Lampa сериализует всё в json и на
+                        // кольце падает.
+                        if (other === element) return playlist.push(playItem(element, stream));
                         if (other.method === 'play') return playlist.push(playItem(other, other));
+
+                        // Внешний плеер получает плейлист json'ом и
+                        // функцию-ссылку вызвать не сможет. Для него у
+                        // балансера бывает готовая ссылка stream.
+                        if (external() && other.stream) return playlist.push(playItem(other, { url: other.stream }));
 
                         // Ссылку на соседнюю серию балансер отдаёт только по
                         // запросу — просим её, когда плеер до неё дойдёт.
@@ -1786,7 +1799,7 @@
                         playlist.push(cell);
                     });
                 } else {
-                    playlist.push(first);
+                    playlist.push(playItem(element, stream));
                 }
 
                 if (playlist.length > 1) first.playlist = playlist;
