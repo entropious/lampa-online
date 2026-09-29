@@ -296,9 +296,6 @@
     // нет. Дольше пятнадцати секунд не ждём — кто не успел, тот серый.
     var LIFE_POLLS = 15;
     var LIFE_INTERVAL = 1000;
-    // Если любимый балансер так и не нашёлся, через столько открываем первый
-    // попавшийся — ждать остальные серверы до конца незачем.
-    var PICK_FALLBACK = 6000;
 
     var ICON = '<svg viewBox="0 0 24 24" fill="currentColor">' +
         '<path d="M21 3H3a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h5v2h8v-2h5a2 2 0 0 0 2-2V5a2 2 0 0 0-2-2zm0 14H3V5h18v12z"></path>' +
@@ -374,6 +371,7 @@
         .online-parser-skeleton > div { background: rgba(0,0,0,0.3); border-radius: 0.3em; }
         .online-parser-skeleton__ico { width: 4em; height: 4em; margin-right: 2.4em; }
         .online-parser-skeleton__body { height: 1.7em; width: 70%; }
+        .online-parser-progress { font-size: 1.2em; opacity: 0.7; margin: 0.8em 0 1.2em; min-height: 1.3em; }
         .online-parser-loader {
             display: inline-block; width: 1.2em; height: 1.2em; margin-left: 0.5em; vertical-align: middle;
             background: url(./img/loader.svg) no-repeat 50% 50%; background-size: contain;
@@ -671,6 +669,7 @@
         Lampa.Template.add('online_parser_loading',
             '<div class="online-parser-empty">' +
                 '<div class="broadcast__scan"><div></div></div>' +
+                '<div class="online-parser-progress"></div>' +
                 '<div class="online-parser-skeleton selector">' +
                     '<div class="online-parser-skeleton__ico"></div><div class="online-parser-skeleton__body"></div>' +
                 '</div>' +
@@ -917,6 +916,148 @@
         }
     };
 
+    // ------------------------------------------------------ проверка потока
+
+    // Относительная ссылка из m3u8. URL() на старых телевизорах нет.
+    function resolveUrl(base, link) {
+        if (/^https?:\/\//i.test(link)) return link;
+        if (link.indexOf('//') === 0) return base.split('//')[0] + link;
+
+        var origin = (base.match(/^(https?:\/\/[^/]+)/i) || [])[1] || '';
+        if (link.charAt(0) === '/') return origin + link;
+
+        return base.split('?')[0].replace(/[^/]*$/, '') + link;
+    }
+
+    // Начало ответа, без скачивания целиком: после limit байт запрос
+    // обрывается. Range не ставим — это лишний preflight, который часть
+    // CDN не пропускает. Читаем потоком через fetch: XHR копит весь ответ
+    // в строку, и на быстром канале или бесконечном потоке (торрент)
+    // успевает съесть сотни мегабайт, прежде чем его оборвут.
+    function peek(url, limit, done) {
+        var finished = false;
+        var controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
+        var timer = setTimeout(function () { finish(null); }, 15000);
+
+        function finish(result) {
+            if (finished) return;
+            finished = true;
+            clearTimeout(timer);
+            if (controller) {
+                try { controller.abort(); } catch (e) {}
+            }
+            done(result);
+        }
+
+        if (typeof fetch === 'undefined' || !controller || typeof TextDecoder === 'undefined') return peekXhr(url, limit, finish);
+
+        fetch(url, { signal: controller.signal, credentials: 'omit' }).then(function (response) {
+            if (!response.ok || !response.body || !response.body.getReader) return finish(null);
+
+            var reader = response.body.getReader();
+            var decoder = new TextDecoder('latin1');
+            var text = '';
+            var info = { type: response.headers.get('Content-Type') || '', url: response.url || url };
+
+            function read() {
+                reader.read().then(function (chunk) {
+                    if (chunk.value) text += decoder.decode(chunk.value, { stream: true });
+
+                    if (chunk.done || text.length >= limit) {
+                        try { reader.cancel(); } catch (e) {}
+                        return finish({ text: text.slice(0, limit), type: info.type, url: info.url, cut: !chunk.done });
+                    }
+
+                    read();
+                })['catch'](function () { finish(null); });
+            }
+
+            read();
+        })['catch'](function () { finish(null); });
+    }
+
+    // Для старых телевизоров без потокового fetch
+    function peekXhr(url, limit, finish) {
+        var xhr = new XMLHttpRequest();
+
+        function result(ok) {
+            var text = '';
+            var type = '';
+            try { text = xhr.responseText || ''; } catch (e) {}
+            try { type = xhr.getResponseHeader('Content-Type') || ''; } catch (e) {}
+            var status = xhr.status;
+            try { xhr.abort(); } catch (e) {}
+
+            finish(ok && status >= 200 && status < 400
+                ? { text: text.slice(0, limit), type: type, url: xhr.responseURL || url, cut: text.length >= limit }
+                : null);
+        }
+
+        try {
+            xhr.open('GET', url, true);
+            xhr.onprogress = function () {
+                var length = 0;
+                try { length = (xhr.responseText || '').length; } catch (e) {}
+                if (length >= limit) result(true);
+            };
+            xhr.onload = function () { result(true); };
+            xhr.onerror = function () { finish(null); };
+            xhr.send();
+        } catch (e) {
+            finish(null);
+        }
+    }
+
+    // Видео действительно отдаётся: у HLS доходим до первого сегмента, у
+    // файла смотрим первые байты. Пустой ответ или html вместо видео —
+    // провал: так выглядят и мёртвый CDN, и страница с капчей.
+    function checkStream(url, done, depth) {
+        depth = depth || 0;
+
+        peek(url, 65536, function (res) {
+            if (!res) return done(false);
+
+            var text = res.text;
+
+            if (text.indexOf('#EXTM3U') === 0 || text.indexOf('#EXTM3U') === 3) {
+                if (depth > 2) return done(false);
+
+                var lines = text.split(/\r?\n/);
+                // Последняя строка может быть оборвана
+                if (res.cut) lines.pop();
+
+                var next = lines.map(function (l) { return l.trim(); }).filter(function (l) {
+                    return l && l.charAt(0) !== '#';
+                })[0];
+
+                if (!next) return done(false);
+                return checkStream(resolveUrl(res.url, next), done, depth + 1);
+            }
+
+            if (/text\/html/i.test(res.type) || /^\s*</.test(text.slice(0, 20))) return done(false);
+
+            done(text.length >= 1024);
+        });
+    }
+
+    // Ответ Lampac (html) или прямого источника ({ items, buttons }) —
+    // в одном виде
+    function splitBody(body) {
+        var json = typeof body === 'object' ? body : Lampa.Arrays.decodeJson(body, null);
+        var result = { json: json, items: [], buttons: [] };
+
+        if (json && Array.isArray(json.items)) {
+            result.items = json.items;
+            result.buttons = json.buttons || [];
+        } else if (typeof body === 'string' && body.indexOf('videos__') !== -1) {
+            var html = $('<div>' + body + '</div>');
+            result.items = parseElements(html, '.videos__item');
+            result.buttons = parseElements(html, '.videos__button');
+        }
+
+        return result;
+    }
+
     // ------------------------------------------------------------- компонент
 
     function OnlineComponent(object) {
@@ -935,6 +1076,16 @@
         var active = '';
         var auto_picked = false;
         var tried = {};
+
+        // Проверка источников: key → 'queue' | 'run' | 'ok' | 'fail'.
+        // Рабочему запоминается, где нашлось видео, — страница серий и
+        // список сезонов, — чтобы открыть его сразу, не проходя путь заново.
+        var checks = {};
+        var verified = {};
+        var check_queue = [];
+        var check_running = 0;
+        var check_nets = [];
+        var pick_timer = null;
         var settled = 0;
         var messages = [];
         var pollers = [];
@@ -1087,6 +1238,192 @@
             order.sort(function (a, b) {
                 return (sources[a].rank - sources[b].rank) || (sources[a].at - sources[b].at);
             });
+
+            enqueueChecks();
+        }
+
+        // ----- проверка источников
+
+        var CHECK_PARALLEL = 6;
+        var PICK_GRACE = 3000;
+
+        function preferredKeys() {
+            var wanted = [loadChoice().source, Lampa.Storage.get(LAST_SOURCE_KEY, '')].filter(Boolean);
+            var name = String(wanted[wanted.length - 1] || '').split('|')[1];
+
+            order.forEach(function (key) {
+                if (name && sources[key].balanser === name && wanted.indexOf(key) === -1) wanted.push(key);
+            });
+
+            return wanted.filter(function (key) { return sources[key]; });
+        }
+
+        function enqueueChecks() {
+            var preferred = preferredKeys();
+
+            order.forEach(function (key) {
+                if (!sources[key].show || checks[key]) return;
+
+                checks[key] = 'queue';
+                // Тот, что человек выбирал, проверяем первым
+                if (preferred.indexOf(key) !== -1) check_queue.unshift(key);
+                else check_queue.push(key);
+            });
+
+            runChecks();
+        }
+
+        function runChecks() {
+            while (!destroyed && check_running < CHECK_PARALLEL && check_queue.length) {
+                (function (key) {
+                    check_running++;
+                    checks[key] = 'run';
+
+                    probe(key, function (result) {
+                        check_running--;
+                        if (destroyed) return;
+
+                        checks[key] = result ? 'ok' : 'fail';
+                        if (result) verified[key] = result;
+
+                        updateSort();
+                        pick();
+                        runChecks();
+                    });
+                })(check_queue.shift());
+            }
+
+            updateProgress();
+        }
+
+        function checkCounts() {
+            var counts = { total: 0, done: 0, ok: 0 };
+
+            Object.keys(checks).forEach(function (key) {
+                counts.total++;
+                if (checks[key] === 'ok' || checks[key] === 'fail') counts.done++;
+                if (checks[key] === 'ok') counts.ok++;
+            });
+
+            return counts;
+        }
+
+        function checksBusy() {
+            return settled < totalProviders() || check_running > 0 || check_queue.length > 0;
+        }
+
+        function updateProgress() {
+            var counts = checkCounts();
+            var loader = filter.render().find('.online-parser-loader');
+
+            if (checksBusy()) {
+                if (!loader.length) filter.render().find('.filter--sort').append('<span class="online-parser-loader"></span>');
+            } else {
+                loader.remove();
+            }
+
+            if (!active) {
+                scroll.render().find('.online-parser-progress').text(
+                    'Проверяю источники: ' + counts.done + ' из ' + counts.total + (counts.ok ? ', рабочих ' + counts.ok : '')
+                );
+            }
+        }
+
+        // Проходит источник так же, как прошёл бы человек: сезон, при
+        // необходимости выбор тайтла из «похожих», серия, ссылка на поток —
+        // и скачивает начало самого видео. done(null), если что-то сорвалось.
+        function probe(key, done) {
+            var net = new Lampa.Reguest();
+            var steps = 0;
+            var found_seasons = [];
+            var watched = loadChoice().last || {};
+            var year = Core.cardYear(movie);
+
+            check_nets.push(net);
+
+            function fetch(url, next) {
+                if (/^direct:/.test(url)) {
+                    return directRequest(url, directContext(), function (result) {
+                        next(result ? splitBody(result) : null);
+                    });
+                }
+
+                net.timeout(15000);
+                net['native'](account(url), function (body) {
+                    next(splitBody(body));
+                }, function () {
+                    next(null);
+                }, false, { dataType: 'text' });
+            }
+
+            function step(url) {
+                if (destroyed) return;
+                if (++steps > 6) return done(null);
+
+                fetch(url, function (page) {
+                    if (destroyed) return;
+                    if (!page) return done(null);
+
+                    var json = page.json;
+                    // rch и вход по аккаунту проверке не поддаются
+                    if (json && typeof json === 'object' && !Array.isArray(json) && (json.rch || json.accsdb)) return done(null);
+
+                    var videos = page.items.filter(function (i) { return i.method === 'play' || i.method === 'call'; });
+                    var similar = page.items.filter(function (i) { return i.similar; });
+                    var links = page.items.filter(function (i) { return i.method === 'link' && !i.similar; });
+
+                    if (videos.length) return tryVideo(url, videos);
+
+                    if (links.length) {
+                        found_seasons = links.map(function (i) { return { title: i.text, url: i.url }; });
+                        var season = found_seasons.filter(function (s) { return watched.season && seasonNumber(s.title) === watched.season; })[0] ||
+                            found_seasons.filter(function (s) { return seasonNumber(s.title) !== 0; })[0] ||
+                            found_seasons[0];
+                        return step(season.url);
+                    }
+
+                    if (similar.length) {
+                        var same_year = similar.filter(function (i) {
+                            return year && String(i.year || i.start_date || '').slice(0, 4) === String(year);
+                        })[0];
+                        return step((same_year || similar[0]).url);
+                    }
+
+                    done(null);
+                });
+            }
+
+            function tryVideo(page_url, videos) {
+                var target = videos.filter(function (v) {
+                    return watched.episode && v.episode === watched.episode && (!v.season || v.season === watched.season);
+                })[0] || videos[0];
+
+                function verify(stream) {
+                    if (!stream || !stream.url) return done(null);
+                    // Внешний плеер заголовки не передаст — такой поток у
+                    // него не откроется
+                    if (external() && stream.headers && Object.keys(stream.headers).length) return done(null);
+
+                    var link = streamFor(stream).url;
+                    if (!link) return done(null);
+
+                    checkStream(link, function (ok) {
+                        if (destroyed) return;
+                        done(ok ? { page: page_url, seasons: found_seasons } : null);
+                    });
+                }
+
+                if (target.method === 'play') return verify(target);
+
+                net.timeout(15000);
+                net.silent(account(target.url), function (json) {
+                    verify(json && !json.rch ? json : null);
+                }, function () {
+                    done(null);
+                });
+            }
+
+            step(/^direct:/.test(sources[key].url) ? sources[key].url : requestParams(sources[key].url));
         }
 
         function loadServer(host, done) {
@@ -1116,7 +1453,7 @@
 
                     addSources(host, json && json.online, true);
                     updateSort();
-                    pick(false);
+                    pick();
 
                     if ((json && json.ready) || polls >= LIFE_POLLS) finish();
                     else timers.push(setTimeout(function () { poll(memkey); }, LIFE_INTERVAL));
@@ -1156,19 +1493,17 @@
                 return message('Нет серверов', 'Впишите адрес сервера Lampac в настройках → «Онлайн».');
             }
 
-            filter.render().find('.filter--sort').append('<span class="online-parser-loader"></span>');
-
-            timers.push(setTimeout(function () { pick(true); }, PICK_FALLBACK));
+            updateProgress();
 
             var direct = Object.keys(DIRECT).filter(function (id) { return DIRECT[id].match(movie); });
-            var total = list.length + direct.length;
+            var total = totalProviders();
 
             function settle() {
                 settled++;
 
                 if (settled === total) {
-                    filter.render().find('.online-parser-loader').remove();
-                    pick(true);
+                    updateProgress();
+                    pick();
                 }
             }
 
@@ -1187,6 +1522,10 @@
             });
         }
 
+        function totalProviders() {
+            return servers().length + Object.keys(DIRECT).filter(function (id) { return DIRECT[id].match(movie); }).length;
+        }
+
         // Прямым источникам нужно то же, что серверу: карточка, тип и
         // уточнённое название. Сюда же они складывают найденное, чтобы не
         // искать второй раз при открытии.
@@ -1199,44 +1538,64 @@
             return direct_context;
         }
 
-        // Открываем то, что смотрели в этом фильме, а если он новый — тот
-        // балансер, что выбирали последним вообще. Пока серверы досчитывают,
-        // ждём именно его; сдаёмся на первый попавшийся, только когда ждать
-        // больше нечего.
-        function pick(give_up) {
+        // Открываем только проверенное. Тот, что смотрели в этом фильме или
+        // выбирали последним, — как только он прошёл проверку; пока он ещё
+        // проверяется, ждём его. Иначе — первый рабочий, не дожидаясь
+        // остальных: список дополнится сам.
+        function pick() {
             if (active || destroyed) return;
 
-            var wanted = [loadChoice().source, Lampa.Storage.get(LAST_SOURCE_KEY, '')];
+            var preferred = preferredKeys();
 
-            for (var i = 0; i < wanted.length; i++) {
-                if (wanted[i] && sources[wanted[i]] && sources[wanted[i]].show) return open(wanted[i], true);
+            for (var i = 0; i < preferred.length; i++) {
+                var state = checks[preferred[i]];
+                if (state === 'ok') return open(preferred[i], true);
+                if (state === 'queue' || state === 'run') return;
             }
-
-            // Имя балансера без сервера: вдруг его перенесли на другой
-            var name = String(wanted[1] || '').split('|')[1];
-            var same = name && order.filter(function (key) {
-                return sources[key].balanser === name && sources[key].show;
-            })[0];
-            if (same) return open(same, true);
-
-            if (!give_up) return;
 
             var first = nextCandidate();
 
-            if (first) return open(first, true);
-            if (settled < servers().length) return;
+            if (first) {
+                // Первым отвечает не лучший, а самый быстрый. Даём остальным
+                // пару секунд и открываем лучший по порядку из прошедших.
+                if (!checksBusy()) return open(first, true);
+                if (!pick_timer) {
+                    pick_timer = setTimeout(function () {
+                        var best = nextCandidate();
+                        if (best && !active) open(best, true);
+                    }, PICK_GRACE);
+                    timers.push(pick_timer);
+                }
+                return;
+            }
 
-            if (messages.length) message('Ничего не нашлось', messages.join('<br>'));
-            else message('Ничего не нашлось', 'Ни один балансер не знает этот фильм. Попробуйте уточнить название через поиск.', true);
+            if (checksBusy()) return;
+
+            var counts = checkCounts();
+            if (messages.length && !counts.total) return message('Ничего не нашлось', messages.join('<br>'));
+
+            message('Рабочих источников нет',
+                counts.total
+                    ? 'Проверено ' + counts.total + ' — ни один не отдал видео. Попробуйте уточнить название через поиск или зайти позже.'
+                    : 'Ни один балансер не знает этот фильм. Попробуйте уточнить название через поиск.',
+                true);
         }
 
-        // Следующий, кого стоит попробовать: сначала проверенные сервером,
-        // потом остальные, и никого дважды.
+        // Следующий рабочий, кого ещё не открывали
         function nextCandidate() {
-            var left = order.filter(function (key) { return sources[key].show && !tried[key]; });
-            var checked = left.filter(function (key) { return sources[key].confirmed; });
+            return workingOrder().filter(function (key) { return !tried[key]; })[0];
+        }
 
-            return checked[0] || left[0];
+        // Рабочие по порядку: сначала на русском, балансеры с другим языком
+        // озвучки — в конце. Их Lampac подписывает прямо в названии.
+        function foreign(key) {
+            return /\((Украинский|Грузинский|ENG|English|Казахский|Армянский)\)/i.test(sources[key].name);
+        }
+
+        function workingOrder() {
+            var working = order.filter(function (key) { return checks[key] === 'ok'; });
+            return working.filter(function (key) { return !foreign(key); })
+                .concat(working.filter(foreign));
         }
 
         function open(key, auto) {
@@ -1253,6 +1612,12 @@
             updateSort();
             updateFilter();
             reset();
+
+            if (verified[key]) {
+                seasons = verified[key].seasons.slice();
+                return request(verified[key].page);
+            }
+
             request(/^direct:/.test(sources[key].url) ? sources[key].url : requestParams(sources[key].url));
         }
 
@@ -1293,16 +1658,9 @@
                 if (json.rch) return remoteClient(json, function () { request(last_url); });
             }
 
-            var items, buttons;
-
-            if (json && Array.isArray(json.items)) {
-                items = json.items;
-                buttons = json.buttons || [];
-            } else {
-                var html = $('<div>' + (typeof body === 'string' ? body : '') + '</div>');
-                items = parseElements(html, '.videos__item');
-                buttons = parseElements(html, '.videos__button');
-            }
+            var split = splitBody(body);
+            var items = split.items;
+            var buttons = split.buttons;
 
             var videos = items.filter(function (item) {
                 return item.method === 'play' || item.method === 'call';
@@ -1905,12 +2263,15 @@
         // ----- фильтр
 
         function updateSort() {
-            filter.set('sort', order.map(function (key) {
+            var working = workingOrder();
+            if (active && working.indexOf(active) === -1) working.unshift(active);
+
+            filter.set('sort', working.map(function (key) {
                 return {
                     title: sources[key].name,
                     source: key,
                     selected: key === active,
-                    ghost: !sources[key].show
+                    ghost: checks[key] !== 'ok'
                 };
             }));
 
@@ -2093,6 +2454,7 @@
             destroyed = true;
             network.clear();
             pollers.forEach(function (net) { net.clear(); });
+            check_nets.forEach(function (net) { net.clear(); });
             timers.forEach(clearTimeout);
             clearTimeout(requests_timer);
             clearImages();
@@ -2124,7 +2486,8 @@
             className: 'online-parser--button',
             icon: ICON,
             title: 'Онлайн',
-            after: '.view--torrent',
+            // Второй в ряду, сразу за первой родной кнопкой («Смотреть»)
+            after: '.full-start__button',
             onEnter: function () { openOnline(ctx); }
         });
     }
