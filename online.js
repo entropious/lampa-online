@@ -379,6 +379,10 @@
         .online-parser-skeleton__ico { width: 4em; height: 4em; margin-right: 2.4em; }
         .online-parser-skeleton__body { height: 1.7em; width: 70%; }
         .online-parser-progress { font-size: 1.2em; opacity: 0.7; margin: 0.8em 0 1.2em; min-height: 1.3em; }
+        .online-parser-better {
+            display: inline-block; margin-left: 0.5em; padding: 0.1em 0.45em; vertical-align: middle;
+            font-size: 0.8em; border-radius: 0.3em; background: rgba(255,255,255,0.15); opacity: 0.8;
+        }
         .online-parser-loader {
             display: inline-block; width: 1.2em; height: 1.2em; margin-left: 0.5em; vertical-align: middle;
             background: url(./img/loader.svg) no-repeat 50% 50%; background-size: contain;
@@ -3107,9 +3111,41 @@
             });
         }
 
+        // Проверка нашла источник лучше открытого — не переключаем, а тихо
+        // помечаем рядом с «Источником»: «↑ 4K» или, если разрешение то же,
+        // «↑ 6.3 mbps». Неполный сериал не в счёт.
+        function betterSource() {
+            if (!active || !verified[active]) return null;
+
+            var best = workingOrder().filter(function (key) {
+                return key === active || !partial(key);
+            })[0];
+            if (!best || best === active) return null;
+
+            var a = verified[active];
+            var b = verified[best];
+
+            if ((b.quality || 0) > (a.quality || 0)) return '↑ ' + qualityName(b.quality);
+            if ((b.quality || 0) === (a.quality || 0) && (b.bitrate || 0) > (a.bitrate || 0) * 1.15) return '↑ ' + bitrateName(b.bitrate);
+
+            return null;
+        }
+
+        function updateBetter() {
+            var button = filter.render().find('.filter--sort');
+            var badge = button.find('.online-parser-better');
+            var text = betterSource();
+
+            if (!text) return badge.remove();
+            if (!badge.length) badge = $('<span class="online-parser-better"></span>').appendTo(button);
+
+            badge.text(text);
+        }
+
         function updateSort() {
             filter.set('sort', sortItems());
             filter.chosen('sort', active && sources[active] ? [sourceTitle(active)] : []);
+            updateBetter();
 
             if (sources_open) refreshSources();
         }
