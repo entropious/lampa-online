@@ -1668,6 +1668,7 @@
 
         var CHECK_PARALLEL = 6;
         var PICK_GRACE = 5000;
+        var MIN_QUALITY = 720;
 
         function preferredKeys() {
             var wanted = [loadChoice().source, Lampa.Storage.get(LAST_SOURCE_KEY, '')].filter(Boolean);
@@ -1705,7 +1706,15 @@
                         check_running--;
                         if (destroyed) return;
 
-                        checks[key] = result ? 'ok' : 'fail';
+                        // Ниже 720p не показываем вовсе. Качество, которое не
+                        // удалось узнать ни из видео, ни от балансера, не
+                        // повод выкидывать рабочий источник.
+                        if (result && result.quality && result.quality < MIN_QUALITY) {
+                            checks[key] = 'low';
+                            result = null;
+                        }
+
+                        if (!checks[key] || checks[key] === 'run') checks[key] = result ? 'ok' : 'fail';
                         if (result) verified[key] = result;
 
                         updateSort();
@@ -1723,7 +1732,8 @@
 
             Object.keys(checks).forEach(function (key) {
                 counts.total++;
-                if (checks[key] === 'ok' || checks[key] === 'fail') counts.done++;
+                if (checks[key] === 'ok' || checks[key] === 'fail' || checks[key] === 'low') counts.done++;
+                if (checks[key] === 'low') counts.low = (counts.low || 0) + 1;
                 if (checks[key] === 'ok') counts.ok++;
             });
 
@@ -2026,7 +2036,9 @@
 
             message('Рабочих источников нет',
                 counts.total
-                    ? 'Проверено ' + counts.total + ' — ни один не отдал видео. Попробуйте уточнить название через поиск или зайти позже.'
+                    ? 'Проверено ' + counts.total + ' — ни один не отдал видео в 720p и выше' +
+                        (counts.low ? ' (в худшем качестве — ' + counts.low + ')' : '') +
+                        '. Попробуйте уточнить название через поиск или зайти позже.'
                     : 'Ни один балансер не знает этот фильм. Попробуйте уточнить название через поиск.',
                 true);
         }
@@ -2121,7 +2133,7 @@
             if (!info) return name;
 
             var parts = [];
-            if (info.quality) parts.push(qualityName(info.quality) + (info.measured ? '' : '?'));
+            parts.push(info.quality ? qualityName(info.quality) + (info.measured ? '' : '?') : 'качество ?');
             if (partial(key)) parts.push(info.episodes + ' сер.');
 
             return parts.length ? name + ' — ' + parts.join(', ') : name;
