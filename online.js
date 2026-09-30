@@ -958,7 +958,11 @@
             var reader = response.body.getReader();
             var chunks = [];
             var size = 0;
-            var info = { type: response.headers.get('Content-Type') || '', url: response.url || url };
+            var info = {
+                type: response.headers.get('Content-Type') || '',
+                url: response.url || url,
+                length: parseInt(response.headers.get('Content-Length'), 10) || 0
+            };
 
             function read() {
                 reader.read().then(function (chunk) {
@@ -978,7 +982,15 @@
                             at += part.length;
                         }
 
-                        return finish({ bytes: bytes, type: info.type, url: info.url, cut: !chunk.done });
+                        return finish({
+                            bytes: bytes,
+                            type: info.type,
+                            url: info.url,
+                            cut: !chunk.done,
+                            // Полный объём: из заголовка, а если ответ
+                            // пришёл целиком — сколько пришло
+                            length: info.length || (chunk.done ? size : 0)
+                        });
                     }
 
                     read();
@@ -1008,7 +1020,11 @@
             var bytes = typeof Uint8Array !== 'undefined' ? new Uint8Array(length) : [];
             for (var i = 0; i < length; i++) bytes[i] = text.charCodeAt(i) & 0xff;
 
-            finish({ bytes: bytes, type: type, url: xhr.responseURL || url, cut: text.length >= limit });
+            var total = 0;
+            try { total = parseInt(xhr.getResponseHeader('Content-Length'), 10) || 0; } catch (e) {}
+            var cut = text.length >= limit;
+
+            finish({ bytes: bytes, type: type, url: xhr.responseURL || url, cut: cut, length: total || (cut ? 0 : text.length) });
         }
 
         try {
@@ -1332,6 +1348,26 @@
         return null;
     }
 
+    // Длительность ролика из mvhd — если заголовок в начале файла
+    function mp4Duration(bytes) {
+        for (var i = 4; i + 40 < bytes.length; i++) {
+            if (bytes[i] !== 0x6d || bytes[i + 1] !== 0x76 || bytes[i + 2] !== 0x68 || bytes[i + 3] !== 0x64) continue;
+
+            var v1 = bytes[i + 4] === 1;
+            var at = i + (v1 ? 24 : 16);
+            var scale = ((bytes[at] << 24) >>> 0) + (bytes[at + 1] << 16) + (bytes[at + 2] << 8) + bytes[at + 3];
+            var d = at + 4;
+            var duration = v1
+                ? (((bytes[d] << 24) >>> 0) + (bytes[d + 1] << 16) + (bytes[d + 2] << 8) + bytes[d + 3]) * 4294967296 +
+                    ((bytes[d + 4] << 24) >>> 0) + (bytes[d + 5] << 16) + (bytes[d + 6] << 8) + bytes[d + 7]
+                : ((bytes[d] << 24) >>> 0) + (bytes[d + 1] << 16) + (bytes[d + 2] << 8) + bytes[d + 3];
+
+            if (scale > 0 && duration > 0) return duration / scale;
+        }
+
+        return 0;
+    }
+
     function videoSize(bytes) {
         if (!bytes || bytes.length < 16) return null;
         if (bytes[0] === 0x47 || (bytes[188] === 0x47 && bytes[376] === 0x47)) return tsSize(bytes);
@@ -1371,6 +1407,45 @@
             parts.push(String.fromCharCode.apply(null, Array.prototype.slice.call(bytes, i, Math.min(i + 8192, end))));
         }
         return parts.join('');
+    }
+
+    // Объём ответа из заголовков, без тела: соединение рвётся, как только
+    // пришли заголовки. Content-Length браузер отдаёт и через CORS.
+    function headLength(url, done) {
+        var finished = false;
+        var timer = setTimeout(function () { finish(0); }, 10000);
+
+        function finish(length) {
+            if (finished) return;
+            finished = true;
+            clearTimeout(timer);
+            done(length);
+        }
+
+        if (typeof fetch !== 'undefined' && typeof AbortController !== 'undefined') {
+            var controller = new AbortController();
+
+            return fetch(url, { signal: controller.signal, credentials: 'omit' }).then(function (response) {
+                var length = response.ok ? parseInt(response.headers.get('Content-Length'), 10) || 0 : 0;
+                try { controller.abort(); } catch (e) {}
+                finish(length);
+            })['catch'](function () { finish(0); });
+        }
+
+        var xhr = new XMLHttpRequest();
+        try {
+            xhr.open('GET', url, true);
+            xhr.onreadystatechange = function () {
+                if (xhr.readyState < 2) return;
+                var length = xhr.status >= 200 && xhr.status < 400 ? parseInt(xhr.getResponseHeader('Content-Length'), 10) || 0 : 0;
+                try { xhr.abort(); } catch (e) {}
+                finish(length);
+            };
+            xhr.onerror = function () { finish(0); };
+            xhr.send();
+        } catch (e) {
+            finish(0);
+        }
     }
 
     function isPlaylist(bytes) {
@@ -1420,10 +1495,27 @@
     // первого сегмента (и init-сегмента у fMP4), у файла смотрим первые
     // байты. Пустой ответ или html вместо видео — провал: так выглядят и
     // мёртвый CDN, и страница с капчей.
-    // done({ ok, size, claimed }): size — измеренный кадр или null,
-    // claimed — что написано в плейлисте, на случай если измерить не вышло.
-    function checkStream(url, done, depth, claimed) {
+    // Битрейт считаем сами: объём сегмента на его длительность из
+    // плейлиста, у файла — полный размер на длительность фильма. Объём —
+    // из Content-Length, скачивать ради него сегмент целиком не нужно.
+    // done({ ok, size, claimed, bitrate, claimed_bitrate }): size и bitrate
+    // — измеренные (или null), claimed — что написано в плейлисте.
+    // hint.runtime — длительность в секундах из TMDB, если в самом файле
+    // её не найти.
+    function checkStream(url, done, depth, claimed, hint) {
         depth = depth || 0;
+        claimed = claimed || {};
+        hint = hint || {};
+
+        function finish(size, bitrate) {
+            done({
+                ok: true,
+                size: size,
+                claimed: claimed.size || null,
+                bitrate: bitrate > 0 ? Math.round(bitrate) : 0,
+                claimed_bitrate: claimed.bandwidth || 0
+            });
+        }
 
         peek(url, 131072, function (res) {
             if (!res || !res.bytes.length) return done({ ok: false });
@@ -1436,29 +1528,86 @@
                 if (res.cut) lines.pop();
 
                 var variant = bestVariant(lines, res.url);
-                if (variant) return checkStream(variant.url, done, depth + 1, variant.size || claimed);
+                if (variant) {
+                    return checkStream(variant.url, done, depth + 1, {
+                        size: variant.size || claimed.size,
+                        bandwidth: variant.bandwidth || claimed.bandwidth
+                    }, hint);
+                }
 
                 var map = lines.filter(function (l) { return l.indexOf('#EXT-X-MAP') === 0; })[0];
-                var segment = lines.filter(function (l) { return l && l.charAt(0) !== '#'; })[0];
-                if (!segment) return done({ ok: false });
+                var segments = [];
+                for (var i = 0; i < lines.length; i++) {
+                    if (lines[i] && lines[i].charAt(0) !== '#') segments.push(i);
+                }
+                if (!segments.length) return done({ ok: false });
 
-                return peek(resolveUrl(res.url, segment), 131072, function (seg) {
+                // Длительность и, если есть, байтовый диапазон сегмента
+                function segmentInfo(index) {
+                    var info = { url: resolveUrl(res.url, lines[index]), duration: 0, range: 0 };
+
+                    for (var k = index - 1; k >= 0 && lines[k].charAt(0) === '#'; k--) {
+                        if (lines[k].indexOf('#EXTINF:') === 0) info.duration = parseFloat(lines[k].slice(8)) || 0;
+                        if (lines[k].indexOf('#EXT-X-BYTERANGE:') === 0) info.range = parseInt(lines[k].slice(17), 10) || 0;
+                        if (lines[k].indexOf('#EXTM3U') === 0 || lines[k].indexOf('#EXTINF:') === 0) break;
+                    }
+
+                    return info;
+                }
+
+                // Битрейт — по нескольким сегментам, разбросанным по
+                // плейлисту: один сегмент врёт в разы в зависимости от сцены,
+                // а в начале фильма и вовсе заставка. Объём берём из
+                // заголовков, сами сегменты не качаем.
+                var sample = [];
+                var picks = segments.length > 5 ? [0.1, 0.3, 0.5, 0.7, 0.9] : [0];
+                picks.forEach(function (at) {
+                    var index = segments[Math.min(segments.length - 1, Math.floor(segments.length * at))];
+                    if (sample.indexOf(index) === -1) sample.push(index);
+                });
+
+                var first = segmentInfo(segments[0]);
+                var init = map && attr(map, 'URI');
+
+                // Разрешение — из первого сегмента: он начинается с ключевого
+                // кадра, а значит, и с заголовка кодека
+                return peek(first.url, 131072, function (seg) {
                     if (!seg || seg.bytes.length < 1024 || looksLikeHtml(seg)) return done({ ok: false });
 
                     var size = videoSize(seg.bytes);
-                    var init = map && attr(map, 'URI');
+                    var bytes = 0;
+                    var seconds = 0;
+                    var left = sample.length;
 
-                    if (size || !init) return done({ ok: true, size: size, claimed: claimed });
+                    sample.forEach(function (index) {
+                        var info = segmentInfo(index);
 
-                    peek(resolveUrl(res.url, init), 131072, function (head) {
-                        done({ ok: true, size: head ? mp4Size(head.bytes) : null, claimed: claimed });
+                        function add(length) {
+                            if (length > 0 && info.duration > 0.5) {
+                                bytes += length;
+                                seconds += info.duration;
+                            }
+                            if (--left) return;
+
+                            var bitrate = seconds ? bytes * 8 / seconds : 0;
+
+                            if (size || !init) return finish(size, bitrate);
+
+                            peek(resolveUrl(res.url, init), 131072, function (head) {
+                                finish(head ? mp4Size(head.bytes) : null, bitrate);
+                            });
+                        }
+
+                        if (info.range) return add(info.range);
+                        headLength(info.url, add);
                     });
                 });
             }
 
             if (res.bytes.length < 1024 || looksLikeHtml(res)) return done({ ok: false });
 
-            done({ ok: true, size: videoSize(res.bytes), claimed: claimed });
+            var seconds = mp4Duration(res.bytes) || hint.runtime || 0;
+            finish(videoSize(res.bytes), seconds > 60 && res.length ? res.length * 8 / seconds : 0);
         });
     }
 
@@ -1855,6 +2004,8 @@
                             var said = res.claimed ? qualityClass(res.claimed) : claimedQuality(stream, links[i]) || nameQuality(sources[key].name);
 
                             done({
+                                bitrate: res.bitrate || res.claimed_bitrate,
+                                bitrate_measured: !!res.bitrate,
                                 page: page_url,
                                 seasons: found_seasons,
                                 episodes: serial ? videos.length : 0,
@@ -1863,7 +2014,7 @@
                                 measured: !!measured,
                                 size: res.size
                             });
-                        });
+                        }, 0, null, { runtime: runtimeSeconds() });
                     })(0);
                 }
 
@@ -2043,6 +2194,19 @@
                 true);
         }
 
+        // Длительность в секундах из TMDB — для битрейта файла, у которого
+        // её нет в заголовке. У сериала — средняя длина серии.
+        function runtimeSeconds() {
+            var minutes = serial
+                ? (movie.episode_run_time && movie.episode_run_time[0]) || (movie.last_episode_to_air && movie.last_episode_to_air.runtime)
+                : movie.runtime;
+            return (parseInt(minutes, 10) || 0) * 60;
+        }
+
+        function bitrateName(bits) {
+            return bits ? (bits / 1e6).toFixed(bits >= 1e7 ? 0 : 1).replace('.', ',') + ' Мбит/с' : '';
+        }
+
         // Ссылки из карты качеств, лучшая первой
         function qualityLinks(stream) {
             var map = stream.quality && typeof stream.quality === 'object' ? stream.quality : {};
@@ -2077,9 +2241,9 @@
             return /\((Украинский|Грузинский|ENG|English|Казахский|Армянский)\)/i.test(sources[key].name);
         }
 
-        // Внутри каждой группы — по настоящему разрешению, лучшее сверху;
-        // измеренное выше заявленного того же класса. При равенстве —
-        // порядок серверов.
+        // Внутри каждой группы — по настоящему разрешению, лучшее сверху,
+        // внутри одного разрешения — по битрейту. При равенстве — порядок
+        // серверов.
         function workingOrder() {
             var working = order.filter(function (key) { return checks[key] === 'ok'; });
 
@@ -2091,6 +2255,7 @@
                 var qa = verified[a] || {};
                 var qb = verified[b] || {};
                 return ((qb.quality || 0) - (qa.quality || 0)) ||
+                    ((qb.bitrate || 0) - (qa.bitrate || 0)) ||
                     ((qb.measured ? 1 : 0) - (qa.measured ? 1 : 0)) ||
                     (order.indexOf(a) - order.indexOf(b));
             }
@@ -2134,6 +2299,7 @@
 
             var parts = [];
             parts.push(info.quality ? qualityName(info.quality) + (info.measured ? '' : '?') : 'качество ?');
+            if (info.bitrate) parts.push(bitrateName(info.bitrate) + (info.bitrate_measured ? '' : '?'));
             if (partial(key)) parts.push(info.episodes + ' сер.');
 
             return parts.length ? name + ' — ' + parts.join(', ') : name;
@@ -2401,7 +2567,10 @@
         // написал балансер
         function qualityLabel(element) {
             var info = verified[active];
-            if (info && info.quality) return qualityName(info.quality) + (info.measured ? '' : '?');
+            if (info && info.quality) {
+                return qualityName(info.quality) + (info.measured ? '' : '?') +
+                    (info.bitrate ? ' · ' + bitrateName(info.bitrate) + (info.bitrate_measured ? '' : '?') : '');
+            }
             if (element.maxquality) return element.maxquality + (/\d$/.test(element.maxquality) ? 'p' : '');
             if (element.quality && typeof element.quality === 'object') return Object.keys(element.quality)[0] || '';
             return '';
