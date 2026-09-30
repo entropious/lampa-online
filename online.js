@@ -279,6 +279,7 @@
     var SERVERS_KEY = 'online_parser_servers';
     var BUTTON_KEY = 'online_parser_button';
     var RCH_KEY = 'online_parser_rch';
+    var TRAILERS_KEY = 'online_parser_hide_trailers';
     var CHOICE_KEY = 'online_parser_choice';
     var LAST_SOURCE_KEY = 'online_parser_source';
     // Результаты проверки источников по каждому фильму — чтобы повторно
@@ -379,6 +380,9 @@
         .online-parser-skeleton__ico { width: 4em; height: 4em; margin-right: 2.4em; }
         .online-parser-skeleton__body { height: 1.7em; width: 70%; }
         .online-parser-progress { font-size: 1.2em; opacity: 0.7; margin: 0.8em 0 1.2em; min-height: 1.3em; }
+        /* Встроенная кнопка «Трейлеры» (YouTube). Кнопку трейлера из
+           «Случайного» (.button--youtube-trailer) не трогаем. */
+        body.online-parser-no-trailers .full-start__button.view--trailer { display: none !important; }
         .online-parser-better {
             display: inline-block; margin-left: 0.5em; padding: 0.1em 0.45em; vertical-align: middle;
             font-size: 0.8em; border-radius: 0.3em; background: rgba(255,255,255,0.15); opacity: 0.8;
@@ -1695,6 +1699,8 @@
         var check_running = 0;
         var check_nets = [];
         var pick_timer = null;
+        // Человек уже запускал видео — источник под ним не меняем
+        var played = false;
         var settled = 0;
         var messages = [];
         var pollers = [];
@@ -1927,6 +1933,7 @@
                         saveChecks();
                         updateSort();
                         pick();
+                        upgradePartial(key);
                         runChecks();
                     });
                 })(check_queue.shift());
@@ -2260,59 +2267,69 @@
             return direct_context;
         }
 
-        // Открываем только проверенное. Тот, что смотрели в этом фильме или
-        // выбирали последним, — как только он прошёл проверку; пока он ещё
-        // проверяется, ждём его. Иначе — первый рабочий, не дожидаясь
-        // остальных: список дополнится сам.
+        // Открываем только проверенное, и быстро: как только есть первый
+        // рабочий, ждём остальных не дольше PICK_GRACE и открываем лучшее,
+        // что нашлось к этому моменту. Выбранный раньше и полный сезон — в
+        // приоритете, но только если успели пройти проверку: ждать их
+        // дольше нельзя, медленный сервер держал бы экран пустым десятки
+        // секунд.
         function pick() {
-            // Человек сам выбирает в «Источнике» — не перебиваем его
-            if (active || destroyed || sources_open) return;
-
-            var preferred = preferredKeys();
-
-            for (var i = 0; i < preferred.length; i++) {
-                var state = checks[preferred[i]];
-                if (state === 'ok') return open(preferred[i], true);
-                if (state === 'queue' || state === 'run') return;
-            }
+            if (active || destroyed) return;
 
             var first = nextCandidate();
 
-            // Проверено в прошлый раз — открываем сразу, ждать нечего
-            if (first && verified[first].cached && !partial(first)) return open(first, true);
+            if (!first) {
+                if (checksBusy()) return;
 
-            // Неполный сериал открываем, только когда ждать больше некого
-            if (first && partial(first) && checksBusy()) return;
+                var counts = checkCounts();
+                if (messages.length && !counts.total) return message('Ничего не нашлось', messages.join('<br>'));
 
-            if (first) {
-                // Первым отвечает не лучший, а самый быстрый. Даём остальным
-                // пару секунд и открываем лучший по порядку из прошедших.
-                if (!checksBusy()) return open(first, true);
-                if (!pick_timer) {
-                    pick_timer = setTimeout(function () {
-                        pick_timer = null;
-                        var best = nextCandidate();
-                        if (!best || active || sources_open) return;
-                        if (partial(best) && checksBusy()) return;
-                        open(best, true);
-                    }, PICK_GRACE);
-                    timers.push(pick_timer);
-                }
-                return;
+                return message('Рабочих источников нет',
+                    counts.total
+                        ? 'Проверено ' + counts.total + ' — ни один не отдал видео в 720p и выше' +
+                            (counts.low ? ' (в худшем качестве — ' + counts.low + ')' : '') +
+                            '. Попробуйте уточнить название через поиск или зайти позже.'
+                        : 'Ни один балансер не знает этот фильм. Попробуйте уточнить название через поиск.',
+                    true);
             }
 
-            if (checksBusy()) return;
+            var preferred = preferredKeys().filter(function (key) { return checks[key] === 'ok'; })[0];
 
-            var counts = checkCounts();
-            if (messages.length && !counts.total) return message('Ничего не нашлось', messages.join('<br>'));
+            // Выбранный раньше уже проверен или проверено в прошлый раз —
+            // открываем сразу, ждать нечего
+            if (preferred) return open(preferred, true);
+            if (verified[first].cached && !partial(first)) return open(first, true);
+            if (!checksBusy()) return open(bestNow(), true);
 
-            message('Рабочих источников нет',
-                counts.total
-                    ? 'Проверено ' + counts.total + ' — ни один не отдал видео в 720p и выше' +
-                        (counts.low ? ' (в худшем качестве — ' + counts.low + ')' : '') +
-                        '. Попробуйте уточнить название через поиск или зайти позже.'
-                    : 'Ни один балансер не знает этот фильм. Попробуйте уточнить название через поиск.',
-                true);
+            if (!pick_timer) {
+                pick_timer = setTimeout(function () {
+                    pick_timer = null;
+                    if (!active && !destroyed) open(bestNow(), true);
+                }, PICK_GRACE);
+                timers.push(pick_timer);
+            }
+        }
+
+        // Быстрый старт иногда открывает неполный сериал: полные к тому
+        // моменту ещё проверялись. Как только полный прошёл проверку —
+        // переходим на него, пока человек ничего не запустил и не выбрал
+        // источник сам.
+        function upgradePartial(key) {
+            if (!active || !auto_picked || played || sources_open) return;
+            if (checks[key] !== 'ok' || !partial(active) || partial(key)) return;
+
+            var best = bestNow();
+            if (best && best !== active && !partial(best)) open(best, true);
+        }
+
+        // Лучшее из проверенного на сейчас: выбранный раньше, иначе полный
+        // сезон, иначе что есть
+        function bestNow() {
+            var preferred = preferredKeys().filter(function (key) { return checks[key] === 'ok'; })[0];
+            if (preferred) return preferred;
+
+            var left = workingOrder().filter(function (key) { return !tried[key]; });
+            return left.filter(function (key) { return !partial(key); })[0] || left[0];
         }
 
         // Длительность в секундах из TMDB — для битрейта файла, у которого
@@ -2580,6 +2597,16 @@
 
         // ----- отрисовка
 
+        // Контент готов. Если открыто меню «Источник», фокус не забираем —
+        // серии отрисуются за ним, а человек продолжит выбирать
+        function ready() {
+            self.activity.loader(false);
+            if (sources_open && Lampa.Select.opened()) return;
+
+            self.activity.toggle();
+            Lampa.Controller.enable('content');
+        }
+
         function reset() {
             last = null;
             network.clear();
@@ -2624,8 +2651,7 @@
 
             scroll.clear();
             scroll.append(html);
-            self.loading(false);
-            Lampa.Controller.enable('content');
+            ready();
         }
 
         function doesNotAnswer() {
@@ -2841,8 +2867,7 @@
 
                 if (focus) last = focus[0];
 
-                self.loading(false);
-                Lampa.Controller.enable('content');
+                ready();
             });
         }
 
@@ -2881,8 +2906,7 @@
                 scroll.append(html);
             });
 
-            self.loading(false);
-            Lampa.Controller.enable('content');
+            ready();
         }
 
         // ----- воспроизведение
@@ -2969,6 +2993,7 @@
         }
 
         function play(element, videos) {
+            played = true;
             resolve(element, function (stream) {
                 if (!stream || !stream.url) return Lampa.Noty.show('Балансер не отдал ссылку на видео');
 
@@ -3498,6 +3523,15 @@
 
         Lampa.SettingsApi.addParam({
             component: 'online_parser',
+            param: { name: TRAILERS_KEY, type: 'trigger', default: true },
+            field: {
+                name: 'Скрывать трейлеры Lampa',
+                description: 'Встроенная кнопка «Трейлеры» с роликами YouTube на карточке'
+            }
+        });
+
+        Lampa.SettingsApi.addParam({
+            component: 'online_parser',
             param: { name: RCH_KEY, type: 'trigger', default: true },
             field: {
                 name: 'Запросы сервера с устройства',
@@ -3506,9 +3540,28 @@
         });
     }
 
+    // Встроенные трейлеры Lampa — кнопка «Трейлеры» на карточке со списком
+    // роликов YouTube. У Lampa есть для неё флаг disable_features.trailers:
+    // с ним кнопка не создаётся. CSS — на случай, если карточка
+    // нарисовалась раньше, чем загрузился плагин.
+    function applyTrailers() {
+        var hide = !!Lampa.Storage.get(TRAILERS_KEY, true);
+
+        if (window.lampa_settings && window.lampa_settings.disable_features) {
+            window.lampa_settings.disable_features.trailers = hide;
+        }
+
+        $('body').toggleClass('online-parser-no-trailers', hide);
+    }
+
     function startPlugin() {
         addTemplates();
         addSettings();
+        applyTrailers();
+
+        Lampa.Storage.listener.follow('change', function (e) {
+            if (e.name === TRAILERS_KEY) applyTrailers();
+        });
 
         Lampa.Component.add(COMPONENT, OnlineComponent);
         Core.onFullCard(onCard);
