@@ -283,7 +283,9 @@
     var LAST_SOURCE_KEY = 'online_parser_source';
     // Результаты проверки источников по каждому фильму — чтобы повторно
     // открыть его мгновенно, а не ждать проверку заново
-    var CHECKS_KEY = 'online_parser_checks';
+    // Номер растёт, когда меняются правила проверки: иначе полчаса
+    // показывалось бы то, что по новым правилам уже не проходит
+    var CHECKS_KEY = 'online_parser_checks_v2';
     var CHECKS_TTL = 30 * 60 * 1000;
     var CHECKS_KEEP = 30;
 
@@ -1453,6 +1455,10 @@
         }
     }
 
+    function isMatroska(bytes) {
+        return bytes[0] === 0x1a && bytes[1] === 0x45 && bytes[2] === 0xdf && bytes[3] === 0xa3;
+    }
+
     function isPlaylist(bytes) {
         var head = bytesText(bytes, 16);
         return head.indexOf('#EXTM3U') === 0 || head.indexOf('#EXTM3U') === 3;
@@ -1626,6 +1632,13 @@
             }
 
             if (res.bytes.length < 1024 || looksLikeHtml(res)) return done({ ok: false });
+
+            // MKV — это торренты (PidTor и подобные, через TorrServer).
+            // Браузер его толком не играет: Safari никак, Chrome через раз, а
+            // индекс в конце многогигабайтного файла торрент ещё не скачал.
+            // В плеере Lampa это шум и «видео повреждено», так что не
+            // показываем вовсе.
+            if (isMatroska(res.bytes)) return done({ ok: false });
 
             var seconds = mp4Duration(res.bytes) || hint.runtime || 0;
             finish(videoSize(res.bytes), seconds > 60 && res.length ? res.length * 8 / seconds : 0);
