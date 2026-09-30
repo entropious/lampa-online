@@ -931,9 +931,10 @@
 
     // Начало ответа, без скачивания целиком: после limit байт запрос
     // обрывается. Range не ставим — это лишний preflight, который часть
-    // CDN не пропускает. Читаем потоком через fetch: XHR копит весь ответ
-    // в строку, и на быстром канале или бесконечном потоке (торрент)
-    // успевает съесть сотни мегабайт, прежде чем его оборвут.
+    // CDN не пропускает. Читаем потоком через fetch: XHR копит весь ответ,
+    // и на быстром канале или бесконечном потоке (торрент) успевает съесть
+    // сотни мегабайт, прежде чем его оборвут.
+    // done({ bytes, type, url, cut }) или null
     function peek(url, limit, done) {
         var finished = false;
         var controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
@@ -949,23 +950,35 @@
             done(result);
         }
 
-        if (typeof fetch === 'undefined' || !controller || typeof TextDecoder === 'undefined') return peekXhr(url, limit, finish);
+        if (typeof fetch === 'undefined' || !controller || typeof Uint8Array === 'undefined') return peekXhr(url, limit, finish);
 
         fetch(url, { signal: controller.signal, credentials: 'omit' }).then(function (response) {
             if (!response.ok || !response.body || !response.body.getReader) return finish(null);
 
             var reader = response.body.getReader();
-            var decoder = new TextDecoder('latin1');
-            var text = '';
+            var chunks = [];
+            var size = 0;
             var info = { type: response.headers.get('Content-Type') || '', url: response.url || url };
 
             function read() {
                 reader.read().then(function (chunk) {
-                    if (chunk.value) text += decoder.decode(chunk.value, { stream: true });
+                    if (chunk.value) {
+                        chunks.push(chunk.value);
+                        size += chunk.value.length;
+                    }
 
-                    if (chunk.done || text.length >= limit) {
+                    if (chunk.done || size >= limit) {
                         try { reader.cancel(); } catch (e) {}
-                        return finish({ text: text.slice(0, limit), type: info.type, url: info.url, cut: !chunk.done });
+
+                        var bytes = new Uint8Array(Math.min(size, limit));
+                        var at = 0;
+                        for (var i = 0; i < chunks.length && at < bytes.length; i++) {
+                            var part = chunks[i].subarray(0, bytes.length - at);
+                            bytes.set(part, at);
+                            at += part.length;
+                        }
+
+                        return finish({ bytes: bytes, type: info.type, url: info.url, cut: !chunk.done });
                     }
 
                     read();
@@ -976,7 +989,8 @@
         })['catch'](function () { finish(null); });
     }
 
-    // Для старых телевизоров без потокового fetch
+    // Для старых телевизоров без потокового fetch. x-user-defined отдаёт
+    // байты как есть, по одному на символ.
     function peekXhr(url, limit, finish) {
         var xhr = new XMLHttpRequest();
 
@@ -988,13 +1002,18 @@
             var status = xhr.status;
             try { xhr.abort(); } catch (e) {}
 
-            finish(ok && status >= 200 && status < 400
-                ? { text: text.slice(0, limit), type: type, url: xhr.responseURL || url, cut: text.length >= limit }
-                : null);
+            if (!ok || status < 200 || status >= 400) return finish(null);
+
+            var length = Math.min(text.length, limit);
+            var bytes = typeof Uint8Array !== 'undefined' ? new Uint8Array(length) : [];
+            for (var i = 0; i < length; i++) bytes[i] = text.charCodeAt(i) & 0xff;
+
+            finish({ bytes: bytes, type: type, url: xhr.responseURL || url, cut: text.length >= limit });
         }
 
         try {
             xhr.open('GET', url, true);
+            xhr.overrideMimeType('text/plain; charset=x-user-defined');
             xhr.onprogress = function () {
                 var length = 0;
                 try { length = (xhr.responseText || '').length; } catch (e) {}
@@ -1008,35 +1027,438 @@
         }
     }
 
-    // Видео действительно отдаётся: у HLS доходим до первого сегмента, у
-    // файла смотрим первые байты. Пустой ответ или html вместо видео —
-    // провал: так выглядят и мёртвый CDN, и страница с капчей.
-    function checkStream(url, done, depth) {
+    // ------------------------------------------------ разрешение из видео
+
+    // Балансеры пишут качество как хотят: «1080p» у потока 720p — обычное
+    // дело. Настоящий размер кадра лежит в самом видео: в SPS кодека (H.264,
+    // H.265) внутри сегмента TS или в заголовке трека mp4. Разбираем их
+    // прямо из первых килобайт, которые проверка и так скачивает.
+
+    function BitReader(bytes) {
+        this.bytes = bytes;
+        this.pos = 0;
+    }
+
+    BitReader.prototype.bit = function () {
+        var byte = this.bytes[this.pos >> 3];
+        if (byte === undefined) throw new Error('eof');
+        var value = (byte >> (7 - (this.pos & 7))) & 1;
+        this.pos++;
+        return value;
+    };
+
+    BitReader.prototype.bits = function (n) {
+        var value = 0;
+        for (var i = 0; i < n; i++) value = value * 2 + this.bit();
+        return value;
+    };
+
+    BitReader.prototype.skip = function (n) {
+        this.pos += n;
+    };
+
+    // Экспоненциальный код Голомба
+    BitReader.prototype.ue = function () {
+        var zeros = 0;
+        while (this.bit() === 0) {
+            if (++zeros > 31) throw new Error('bad ue');
+        }
+        return Math.pow(2, zeros) - 1 + this.bits(zeros);
+    };
+
+    BitReader.prototype.se = function () {
+        var value = this.ue();
+        return value & 1 ? (value + 1) / 2 : -value / 2;
+    };
+
+    // Внутри NAL после двух нулей вставлен 0x03, чтобы данные не
+    // спутались со стартовым кодом, — выкидываем его
+    function unescapeNal(bytes, start, end) {
+        var out = [];
+        var zeros = 0;
+
+        for (var i = start; i < end; i++) {
+            var byte = bytes[i];
+            if (zeros >= 2 && byte === 3) {
+                zeros = 0;
+                continue;
+            }
+            out.push(byte);
+            zeros = byte === 0 ? zeros + 1 : 0;
+        }
+
+        return out;
+    }
+
+    function h264Size(nal) {
+        var r = new BitReader(nal);
+        r.skip(8); // заголовок NAL
+
+        var profile = r.bits(8);
+        r.skip(16); // флаги ограничений и уровень
+        r.ue(); // id SPS
+
+        var chroma = 1;
+
+        if ([100, 110, 122, 244, 44, 83, 86, 118, 128, 138, 139, 134, 135].indexOf(profile) !== -1) {
+            chroma = r.ue();
+            if (chroma === 3) r.skip(1);
+            r.ue();
+            r.ue();
+            r.skip(1);
+
+            if (r.bit()) {
+                for (var i = 0; i < (chroma !== 3 ? 8 : 12); i++) {
+                    if (!r.bit()) continue;
+
+                    var size = i < 6 ? 16 : 64;
+                    var last = 8;
+                    var next = 8;
+
+                    for (var j = 0; j < size; j++) {
+                        if (next !== 0) next = (last + r.se() + 256) % 256;
+                        if (next !== 0) last = next;
+                    }
+                }
+            }
+        }
+
+        r.ue(); // log2_max_frame_num
+
+        var poc = r.ue();
+        if (poc === 0) {
+            r.ue();
+        } else if (poc === 1) {
+            r.skip(1);
+            r.se();
+            r.se();
+            var cycle = r.ue();
+            for (var c = 0; c < cycle; c++) r.se();
+        }
+
+        r.ue(); // max_num_ref_frames
+        r.skip(1);
+
+        var width_mbs = r.ue() + 1;
+        var height_units = r.ue() + 1;
+        var frame_mbs_only = r.bit();
+        if (!frame_mbs_only) r.skip(1);
+        r.skip(1);
+
+        var crop = [0, 0, 0, 0];
+        if (r.bit()) crop = [r.ue(), r.ue(), r.ue(), r.ue()];
+
+        var unit_x = chroma === 0 || chroma === 3 ? 1 : 2;
+        var unit_y = (chroma === 1 ? 2 : 1) * (2 - frame_mbs_only);
+
+        return {
+            width: width_mbs * 16 - unit_x * (crop[0] + crop[1]),
+            height: (2 - frame_mbs_only) * height_units * 16 - unit_y * (crop[2] + crop[3])
+        };
+    }
+
+    function h265Size(nal) {
+        var r = new BitReader(nal);
+        r.skip(16); // заголовок NAL
+        r.skip(4); // id VPS
+
+        var sub_layers = r.bits(3);
+        r.skip(1);
+
+        // profile_tier_level
+        r.skip(88);
+        r.skip(8);
+
+        var profile_present = [];
+        var level_present = [];
+
+        for (var i = 0; i < sub_layers; i++) {
+            profile_present.push(r.bit());
+            level_present.push(r.bit());
+        }
+
+        if (sub_layers > 0) {
+            for (var k = sub_layers; k < 8; k++) r.skip(2);
+        }
+
+        for (var j = 0; j < sub_layers; j++) {
+            if (profile_present[j]) r.skip(88);
+            if (level_present[j]) r.skip(8);
+        }
+
+        r.ue(); // id SPS
+
+        var chroma = r.ue();
+        if (chroma === 3) r.skip(1);
+
+        var width = r.ue();
+        var height = r.ue();
+
+        if (r.bit()) {
+            var sub_w = chroma === 1 || chroma === 2 ? 2 : 1;
+            var sub_h = chroma === 1 ? 2 : 1;
+            var left = r.ue();
+            var right = r.ue();
+            var top = r.ue();
+            var bottom = r.ue();
+
+            width -= sub_w * (left + right);
+            height -= sub_h * (top + bottom);
+        }
+
+        return { width: width, height: height };
+    }
+
+    function sane(size) {
+        return size && size.width >= 128 && size.width <= 8192 && size.height >= 96 && size.height <= 4608 ? size : null;
+    }
+
+    // SPS в потоке NAL-единиц: ищем стартовый код 00 00 01 и за ним
+    // заголовок нужного типа
+    function spsFromNals(bytes, hevc) {
+        for (var i = 0; i + 4 < bytes.length; i++) {
+            if (bytes[i] !== 0 || bytes[i + 1] !== 0 || bytes[i + 2] !== 1) continue;
+
+            var header = bytes[i + 3];
+            var is_sps = hevc ? ((header >> 1) & 0x3f) === 33 : (header & 0x1f) === 7;
+            if (!is_sps) continue;
+
+            var end = i + 3;
+            while (end + 2 < bytes.length && !(bytes[end] === 0 && bytes[end + 1] === 0 && (bytes[end + 2] === 1 || bytes[end + 2] === 0))) end++;
+
+            try {
+                var nal = unescapeNal(bytes, i + 3, Math.min(end, i + 3 + 512));
+                var size = sane(hevc ? h265Size(nal) : h264Size(nal));
+                if (size) return size;
+            } catch (e) {
+                // обрезанный или битый SPS — ищем следующий
+            }
+        }
+
+        return null;
+    }
+
+    // MPEG-TS: из PAT узнаём PMT, из PMT — PID видео и кодек, потом
+    // собираем полезную нагрузку этого PID и ищем в ней SPS
+    function tsSize(bytes) {
+        var start = -1;
+
+        for (var s = 0; s < Math.min(bytes.length - 376, 188); s++) {
+            if (bytes[s] === 0x47 && bytes[s + 188] === 0x47 && bytes[s + 376] === 0x47) {
+                start = s;
+                break;
+            }
+        }
+
+        if (start < 0) return null;
+
+        function payload(offset) {
+            var afc = (bytes[offset + 3] >> 4) & 3;
+            if (!(afc & 1)) return null;
+            var at = offset + 4;
+            if (afc & 2) at += 1 + bytes[offset + 4];
+            return at < offset + 188 ? at : null;
+        }
+
+        var pmt_pid = -1;
+        var video_pid = -1;
+        var hevc = false;
+        var video = [];
+
+        for (var p = start; p + 188 <= bytes.length; p += 188) {
+            if (bytes[p] !== 0x47) break;
+
+            var pid = ((bytes[p + 1] & 0x1f) << 8) | bytes[p + 2];
+            var unit_start = bytes[p + 1] & 0x40;
+            var at = payload(p);
+            if (at === null) continue;
+
+            if (pid === 0 && unit_start && pmt_pid < 0) {
+                var pat = at + 1 + bytes[at];
+                var pat_end = Math.min(pat + 3 + (((bytes[pat + 1] & 0x0f) << 8) | bytes[pat + 2]) - 4, p + 188);
+                for (var e = pat + 8; e + 4 <= pat_end; e += 4) {
+                    var program = (bytes[e] << 8) | bytes[e + 1];
+                    if (program !== 0) {
+                        pmt_pid = ((bytes[e + 2] & 0x1f) << 8) | bytes[e + 3];
+                        break;
+                    }
+                }
+            } else if (pid === pmt_pid && unit_start && video_pid < 0) {
+                var pmt = at + 1 + bytes[at];
+                var pmt_end = Math.min(pmt + 3 + (((bytes[pmt + 1] & 0x0f) << 8) | bytes[pmt + 2]) - 4, p + 188);
+                var entry = pmt + 12 + (((bytes[pmt + 10] & 0x0f) << 8) | bytes[pmt + 11]);
+
+                while (entry + 5 <= pmt_end) {
+                    var type = bytes[entry];
+                    var es_pid = ((bytes[entry + 1] & 0x1f) << 8) | bytes[entry + 2];
+
+                    if (type === 0x1b || type === 0x24) {
+                        video_pid = es_pid;
+                        hevc = type === 0x24;
+                        break;
+                    }
+
+                    entry += 5 + (((bytes[entry + 3] & 0x0f) << 8) | bytes[entry + 4]);
+                }
+            } else if (pid === video_pid) {
+                for (var b = at; b < p + 188; b++) video.push(bytes[b]);
+                if (video.length > 4096) {
+                    var found = spsFromNals(video, hevc);
+                    if (found) return found;
+                }
+            }
+        }
+
+        return video.length ? spsFromNals(video, hevc) : null;
+    }
+
+    // mp4: ширина и высота видеодорожки лежат в tkhd числами 16.16.
+    // У звуковой дорожки там нули, её пропускаем.
+    function mp4Size(bytes) {
+        for (var i = 4; i + 96 < bytes.length; i++) {
+            if (bytes[i] !== 0x74 || bytes[i + 1] !== 0x6b || bytes[i + 2] !== 0x68 || bytes[i + 3] !== 0x64) continue;
+
+            var version = bytes[i + 4];
+            var at = i + (version === 1 ? 92 : 80);
+            if (at + 8 > bytes.length) continue;
+
+            var width = ((bytes[at] << 8) | bytes[at + 1]) + bytes[at + 2] / 256;
+            var height = ((bytes[at + 4] << 8) | bytes[at + 5]) + bytes[at + 6] / 256;
+            var size = sane({ width: Math.round(width), height: Math.round(height) });
+
+            if (size) return size;
+        }
+
+        return null;
+    }
+
+    function videoSize(bytes) {
+        if (!bytes || bytes.length < 16) return null;
+        if (bytes[0] === 0x47 || (bytes[188] === 0x47 && bytes[376] === 0x47)) return tsSize(bytes);
+        return mp4Size(bytes) || spsFromNals(bytes, false) || spsFromNals(bytes, true);
+    }
+
+    // Класс качества по размеру кадра. Считаем и по ширине: у широкоэкранного
+    // фильма 1920×800 — это 1080p, хотя высота всего 800.
+    function qualityClass(size) {
+        if (!size) return 0;
+        var w = size.width;
+        var h = size.height;
+
+        if (w >= 3200 || h >= 1800) return 2160;
+        if (w >= 2200 || h >= 1300) return 1440;
+        if (w >= 1700 || h >= 1000) return 1080;
+        if (w >= 1150 || h >= 700) return 720;
+        if (w >= 700 || h >= 400) return 480;
+        return 360;
+    }
+
+    function qualityNumber(name) {
+        name = String(name || '');
+        if (/4k|uhd/i.test(name)) return 2160;
+        return parseInt(name, 10) || 0;
+    }
+
+    function qualityName(value) {
+        return value >= 2160 ? '4K' : value ? value + 'p' : '';
+    }
+
+    // Байты в строку для m3u8: там только ASCII, так что без декодера
+    function bytesText(bytes, limit) {
+        var parts = [];
+        var end = Math.min(bytes.length, limit || bytes.length);
+        for (var i = 0; i < end; i += 8192) {
+            parts.push(String.fromCharCode.apply(null, Array.prototype.slice.call(bytes, i, Math.min(i + 8192, end))));
+        }
+        return parts.join('');
+    }
+
+    function isPlaylist(bytes) {
+        var head = bytesText(bytes, 16);
+        return head.indexOf('#EXTM3U') === 0 || head.indexOf('#EXTM3U') === 3;
+    }
+
+    function looksLikeHtml(res) {
+        return /text\/html/i.test(res.type) || /^\s*</.test(bytesText(res.bytes, 32));
+    }
+
+    function attr(line, name) {
+        var match = line.match(new RegExp(name + '=("([^"]*)"|[^,]*)'));
+        return match ? (match[2] !== undefined ? match[2] : match[1]) : '';
+    }
+
+    // Из мастер-плейлиста — лучший вариант: по размеру кадра, а если он не
+    // указан, по битрейту. Раньше брался первый, а первым часто идёт 360p.
+    function bestVariant(lines, base) {
+        var best = null;
+
+        for (var i = 0; i < lines.length; i++) {
+            if (lines[i].indexOf('#EXT-X-STREAM-INF') !== 0) continue;
+
+            var uri = '';
+            for (var j = i + 1; j < lines.length && !uri; j++) {
+                if (lines[j] && lines[j].charAt(0) !== '#') uri = lines[j];
+            }
+            if (!uri) continue;
+
+            var res = attr(lines[i], 'RESOLUTION').split('x');
+            var variant = {
+                url: resolveUrl(base, uri),
+                size: res.length === 2 ? { width: parseInt(res[0], 10) || 0, height: parseInt(res[1], 10) || 0 } : null,
+                bandwidth: parseInt(attr(lines[i], 'BANDWIDTH'), 10) || 0
+            };
+            var pixels = variant.size ? variant.size.width * variant.size.height : 0;
+            var best_pixels = best && best.size ? best.size.width * best.size.height : 0;
+
+            if (!best || pixels > best_pixels || (pixels === best_pixels && variant.bandwidth > best.bandwidth)) best = variant;
+        }
+
+        return best;
+    }
+
+    // Видео действительно отдаётся, и какого оно размера. У HLS доходим до
+    // первого сегмента (и init-сегмента у fMP4), у файла смотрим первые
+    // байты. Пустой ответ или html вместо видео — провал: так выглядят и
+    // мёртвый CDN, и страница с капчей.
+    // done({ ok, size, claimed }): size — измеренный кадр или null,
+    // claimed — что написано в плейлисте, на случай если измерить не вышло.
+    function checkStream(url, done, depth, claimed) {
         depth = depth || 0;
 
-        peek(url, 65536, function (res) {
-            if (!res) return done(false);
+        peek(url, 131072, function (res) {
+            if (!res || !res.bytes.length) return done({ ok: false });
 
-            var text = res.text;
+            if (isPlaylist(res.bytes)) {
+                if (depth > 3) return done({ ok: false });
 
-            if (text.indexOf('#EXTM3U') === 0 || text.indexOf('#EXTM3U') === 3) {
-                if (depth > 2) return done(false);
-
-                var lines = text.split(/\r?\n/);
+                var lines = bytesText(res.bytes).split(/\r?\n/).map(function (l) { return l.trim(); });
                 // Последняя строка может быть оборвана
                 if (res.cut) lines.pop();
 
-                var next = lines.map(function (l) { return l.trim(); }).filter(function (l) {
-                    return l && l.charAt(0) !== '#';
-                })[0];
+                var variant = bestVariant(lines, res.url);
+                if (variant) return checkStream(variant.url, done, depth + 1, variant.size || claimed);
 
-                if (!next) return done(false);
-                return checkStream(resolveUrl(res.url, next), done, depth + 1);
+                var map = lines.filter(function (l) { return l.indexOf('#EXT-X-MAP') === 0; })[0];
+                var segment = lines.filter(function (l) { return l && l.charAt(0) !== '#'; })[0];
+                if (!segment) return done({ ok: false });
+
+                return peek(resolveUrl(res.url, segment), 131072, function (seg) {
+                    if (!seg || seg.bytes.length < 1024 || looksLikeHtml(seg)) return done({ ok: false });
+
+                    var size = videoSize(seg.bytes);
+                    var init = map && attr(map, 'URI');
+
+                    if (size || !init) return done({ ok: true, size: size, claimed: claimed });
+
+                    peek(resolveUrl(res.url, init), 131072, function (head) {
+                        done({ ok: true, size: head ? mp4Size(head.bytes) : null, claimed: claimed });
+                    });
+                });
             }
 
-            if (/text\/html/i.test(res.type) || /^\s*</.test(text.slice(0, 20))) return done(false);
+            if (res.bytes.length < 1024 || looksLikeHtml(res)) return done({ ok: false });
 
-            done(text.length >= 1024);
+            done({ ok: true, size: videoSize(res.bytes), claimed: claimed });
         });
     }
 
@@ -1245,7 +1667,7 @@
         // ----- проверка источников
 
         var CHECK_PARALLEL = 6;
-        var PICK_GRACE = 3000;
+        var PICK_GRACE = 5000;
 
         function preferredKeys() {
             var wanted = [loadChoice().source, Lampa.Storage.get(LAST_SOURCE_KEY, '')].filter(Boolean);
@@ -1404,13 +1826,35 @@
                     // него не откроется
                     if (external() && stream.headers && Object.keys(stream.headers).length) return done(null);
 
-                    var link = streamFor(stream).url;
-                    if (!link) return done(null);
+                    // Проверяем лучшее из заявленных качеств: его и будем
+                    // замерять. Не открылось — пробуем то, что включится по
+                    // умолчанию.
+                    var links = qualityLinks(stream);
+                    var fallback = streamFor(stream).url;
+                    if (fallback && links.indexOf(fallback) === -1) links.push(fallback);
+                    if (!links.length) return done(null);
 
-                    checkStream(link, function (ok) {
-                        if (destroyed) return;
-                        done(ok ? { page: page_url, seasons: found_seasons } : null);
-                    });
+                    (function next(i) {
+                        if (i >= links.length) return done(null);
+
+                        checkStream(links[i], function (res) {
+                            if (destroyed) return;
+                            if (!res.ok) return next(i + 1);
+
+                            var measured = qualityClass(res.size);
+                            var said = res.claimed ? qualityClass(res.claimed) : claimedQuality(stream, links[i]) || nameQuality(sources[key].name);
+
+                            done({
+                                page: page_url,
+                                seasons: found_seasons,
+                                episodes: serial ? videos.length : 0,
+                                season: serial ? (videos[0].season || 0) : 0,
+                                quality: measured || said,
+                                measured: !!measured,
+                                size: res.size
+                            });
+                        });
+                    })(0);
                 }
 
                 if (target.method === 'play') return verify(target);
@@ -1555,14 +1999,20 @@
 
             var first = nextCandidate();
 
+            // Неполный сериал открываем, только когда ждать больше некого
+            if (first && partial(first) && checksBusy()) return;
+
             if (first) {
                 // Первым отвечает не лучший, а самый быстрый. Даём остальным
                 // пару секунд и открываем лучший по порядку из прошедших.
                 if (!checksBusy()) return open(first, true);
                 if (!pick_timer) {
                     pick_timer = setTimeout(function () {
+                        pick_timer = null;
                         var best = nextCandidate();
-                        if (best && !active) open(best, true);
+                        if (!best || active) return;
+                        if (partial(best) && checksBusy()) return;
+                        open(best, true);
                     }, PICK_GRACE);
                     timers.push(pick_timer);
                 }
@@ -1581,6 +2031,29 @@
                 true);
         }
 
+        // Ссылки из карты качеств, лучшая первой
+        function qualityLinks(stream) {
+            var map = stream.quality && typeof stream.quality === 'object' ? stream.quality : {};
+
+            return Object.keys(map).sort(function (a, b) {
+                return qualityNumber(b) - qualityNumber(a);
+            }).map(function (name) {
+                return splitReserve(map[name]).url;
+            }).filter(Boolean);
+        }
+
+        function claimedQuality(stream, link) {
+            var map = stream.quality && typeof stream.quality === 'object' ? stream.quality : {};
+            var name = Object.keys(map).filter(function (q) { return splitReserve(map[q]).url === link; })[0];
+            return qualityNumber(name || stream.maxquality || '');
+        }
+
+        // Качество, которое балансер вписал себе в название: «Kodik ~ 720p»
+        function nameQuality(name) {
+            var match = String(name || '').match(/(\d{3,4})p|\b4K\b/i);
+            return match ? (match[1] ? parseInt(match[1], 10) : 2160) : 0;
+        }
+
         // Следующий рабочий, кого ещё не открывали
         function nextCandidate() {
             return workingOrder().filter(function (key) { return !tried[key]; })[0];
@@ -1592,10 +2065,66 @@
             return /\((Украинский|Грузинский|ENG|English|Казахский|Армянский)\)/i.test(sources[key].name);
         }
 
+        // Внутри каждой группы — по настоящему разрешению, лучшее сверху;
+        // измеренное выше заявленного того же класса. При равенстве —
+        // порядок серверов.
         function workingOrder() {
             var working = order.filter(function (key) { return checks[key] === 'ok'; });
-            return working.filter(function (key) { return !foreign(key); })
-                .concat(working.filter(foreign));
+
+            function byQuality(a, b) {
+                var pa = partial(a) ? 1 : 0;
+                var pb = partial(b) ? 1 : 0;
+                if (pa !== pb) return pa - pb;
+
+                var qa = verified[a] || {};
+                var qb = verified[b] || {};
+                return ((qb.quality || 0) - (qa.quality || 0)) ||
+                    ((qb.measured ? 1 : 0) - (qa.measured ? 1 : 0)) ||
+                    (order.indexOf(a) - order.indexOf(b));
+            }
+
+            return working.filter(function (key) { return !foreign(key); }).sort(byQuality)
+                .concat(working.filter(foreign).sort(byQuality));
+        }
+
+        // У сериала источник, где серий заметно меньше, чем у лучшего, —
+        // неполный: в 1080p, но с одной серией он не нужен наверху
+        function partial(key) {
+            if (!serial || !verified[key]) return false;
+
+            var most = aired(verified[key].season);
+            Object.keys(verified).forEach(function (k) {
+                if (checks[k] === 'ok') most = Math.max(most, verified[k].episodes || 0);
+            });
+
+            return (verified[key].episodes || 0) < most * 0.8;
+        }
+
+        // Сколько серий сезона уже вышло, по данным TMDB в карточке
+        function aired(season) {
+            if (!season) return 0;
+
+            var last = movie.last_episode_to_air;
+            if (last && last.season_number === season) return last.episode_number || 0;
+
+            var info = (movie.seasons || []).filter(function (s) { return s.season_number === season; })[0];
+            return info ? info.episode_count || 0 : 0;
+        }
+
+        // Название без того качества, что балансер написал про себя, и с
+        // тем, что оказалось на деле. Не измерилось — заявленное со знаком
+        // вопроса.
+        function sourceTitle(key) {
+            var name = sources[key].name.replace(/\s*[~\-–]\s*(\d{3,4}p|4K)(?=\s|$)/i, '');
+            var info = verified[key];
+
+            if (!info) return name;
+
+            var parts = [];
+            if (info.quality) parts.push(qualityName(info.quality) + (info.measured ? '' : '?'));
+            if (partial(key)) parts.push(info.episodes + ' сер.');
+
+            return parts.length ? name + ' — ' + parts.join(', ') : name;
         }
 
         function open(key, auto) {
@@ -1856,7 +2385,11 @@
             }).join('<span class="online-parser__split">●</span>');
         }
 
+        // У серии — качество, измеренное проверкой источника, а не то, что
+        // написал балансер
         function qualityLabel(element) {
+            var info = verified[active];
+            if (info && info.quality) return qualityName(info.quality) + (info.measured ? '' : '?');
             if (element.maxquality) return element.maxquality + (/\d$/.test(element.maxquality) ? 'p' : '');
             if (element.quality && typeof element.quality === 'object') return Object.keys(element.quality)[0] || '';
             return '';
@@ -2268,14 +2801,14 @@
 
             filter.set('sort', working.map(function (key) {
                 return {
-                    title: sources[key].name,
+                    title: sourceTitle(key),
                     source: key,
                     selected: key === active,
                     ghost: checks[key] !== 'ok'
                 };
             }));
 
-            filter.chosen('sort', active && sources[active] ? [sources[active].name] : []);
+            filter.chosen('sort', active && sources[active] ? [sourceTitle(active)] : []);
         }
 
         function updateFilter() {
