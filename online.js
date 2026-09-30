@@ -280,6 +280,7 @@
     var BUTTON_KEY = 'online_parser_button';
     var RCH_KEY = 'online_parser_rch';
     var TRAILERS_KEY = 'online_parser_hide_trailers';
+    var TORRENT_M3U_KEY = 'online_parser_torrent_m3u';
     var CHOICE_KEY = 'online_parser_choice';
     var LAST_SOURCE_KEY = 'online_parser_source';
     // Результаты проверки источников по каждому фильму — чтобы повторно
@@ -3532,6 +3533,15 @@
 
         Lampa.SettingsApi.addParam({
             component: 'online_parser',
+            param: { name: TORRENT_M3U_KEY, type: 'trigger', default: true },
+            field: {
+                name: 'Торренты во внешнем плеере — плейлистом',
+                description: 'IINA, mpv, VLC и nPlayer получают всю раздачу с выбранной серии, и серии можно переключать в самом плеере. Нужен TorrServer MatriX.143 или новее, чтобы плейлист начинался с выбранной серии.'
+            }
+        });
+
+        Lampa.SettingsApi.addParam({
+            component: 'online_parser',
             param: { name: RCH_KEY, type: 'trigger', default: true },
             field: {
                 name: 'Запросы сервера с устройства',
@@ -3554,10 +3564,48 @@
         $('body').toggleClass('online-parser-no-trailers', hide);
     }
 
+    // Торренты Lampa (через TorrServer) во внешнем плеере на macOS и iOS
+    // уходят одним файлом: Lampa передаёт IINA, mpv, VLC и nPlayer только
+    // ссылку, плейлист туда не попадает, и серии в плеере не переключить.
+    // Подменяем ссылку на M3U самого TorrServer — с выбранной серии до
+    // конца раздачи. index в M3U TorrServer понимает с MatriX.143, старые
+    // версии его игнорируют, поэтому добавляем fromlast и заранее отмечаем
+    // выбранную серию просмотренной: тогда и они начнут с неё.
+    var M3U_PLAYERS = ['iina', 'mpv', 'vlc', 'nplayer'];
+
+    function torrentPlaylist(data) {
+        if (!Lampa.Storage.get(TORRENT_M3U_KEY, true)) return;
+        if (!data || !data.torrent_hash || typeof data.url !== 'string') return;
+        if (!(Lampa.Platform.macOS && Lampa.Platform.macOS()) && !Lampa.Platform.is('apple')) return;
+
+        var app = data.launch_player || Lampa.Storage.field('player_torrent');
+        if (M3U_PLAYERS.indexOf(app) === -1) return;
+
+        // …/stream/<имя файла>?link=<хэш>&index=<N>&play
+        var match = data.url.match(/^(.*\/stream\/)([^?]*)\?(.*)$/);
+        if (!match) return;
+
+        var query = match[3];
+        var link = (query.match(/(?:^|&)link=([^&]+)/) || [])[1];
+        var index = (query.match(/(?:^|&)index=(\d+)/) || [])[1];
+        if (!link || !index) return;
+
+        try {
+            if (Lampa.Torserver && Lampa.Torserver.viewedSet) Lampa.Torserver.viewedSet(link, parseInt(index, 10), 0);
+        } catch (e) {}
+
+        var name = decodeURIComponent(match[2]).replace(/\.[^.]+$/, '') || 'playlist';
+        data.url = match[1] + encodeURIComponent(name) + '.m3u?link=' + link + '&index=' + index + '&m3u&fromlast';
+    }
+
     function startPlugin() {
         addTemplates();
         addSettings();
         applyTrailers();
+
+        Lampa.Player.listener.follow('create', function (e) {
+            torrentPlaylist(e.data);
+        });
 
         Lampa.Storage.listener.follow('change', function (e) {
             if (e.name === TRAILERS_KEY) applyTrailers();
