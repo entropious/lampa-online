@@ -281,6 +281,11 @@
     var RCH_KEY = 'online_parser_rch';
     var CHOICE_KEY = 'online_parser_choice';
     var LAST_SOURCE_KEY = 'online_parser_source';
+    // Результаты проверки источников по каждому фильму — чтобы повторно
+    // открыть его мгновенно, а не ждать проверку заново
+    var CHECKS_KEY = 'online_parser_checks';
+    var CHECKS_TTL = 30 * 60 * 1000;
+    var CHECKS_KEEP = 30;
 
     // Эти ключи общие со всеми клиентами Lampac, и это полезно. uid сервер
     // привязывает к оплаченному доступу — купленный через чужой плагин премиум
@@ -938,7 +943,7 @@
     function peek(url, limit, done) {
         var finished = false;
         var controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
-        var timer = setTimeout(function () { finish(null); }, 15000);
+        var timer = setTimeout(function () { finish(null); }, 10000);
 
         function finish(result) {
             if (finished) return;
@@ -1569,39 +1574,55 @@
                 var first = segmentInfo(segments[0]);
                 var init = map && attr(map, 'URI');
 
-                // Разрешение — из первого сегмента: он начинается с ключевого
-                // кадра, а значит, и с заголовка кодека
-                return peek(first.url, 131072, function (seg) {
-                    if (!seg || seg.bytes.length < 1024 || looksLikeHtml(seg)) return done({ ok: false });
+                // Всё сразу, параллельно: первый сегмент (из него разрешение —
+                // он начинается с ключевого кадра, а значит, и с заголовка
+                // кодека), init-сегмент fMP4 и заголовки сегментов для
+                // битрейта. По очереди это были бы лишние секунды на каждый
+                // источник.
+                var pending = 1 + sample.length + (init ? 1 : 0);
+                var failed = false;
+                var size = null;
+                var init_size = null;
+                var bytes = 0;
+                var seconds = 0;
 
-                    var size = videoSize(seg.bytes);
-                    var bytes = 0;
-                    var seconds = 0;
-                    var left = sample.length;
+                function part() {
+                    if (--pending || failed) return;
+                    finish(size || init_size, seconds ? bytes * 8 / seconds : 0);
+                }
 
-                    sample.forEach(function (index) {
-                        var info = segmentInfo(index);
-
-                        function add(length) {
-                            if (length > 0 && info.duration > 0.5) {
-                                bytes += length;
-                                seconds += info.duration;
-                            }
-                            if (--left) return;
-
-                            var bitrate = seconds ? bytes * 8 / seconds : 0;
-
-                            if (size || !init) return finish(size, bitrate);
-
-                            peek(resolveUrl(res.url, init), 131072, function (head) {
-                                finish(head ? mp4Size(head.bytes) : null, bitrate);
-                            });
-                        }
-
-                        if (info.range) return add(info.range);
-                        headLength(info.url, add);
-                    });
+                peek(first.url, 131072, function (seg) {
+                    if (!seg || seg.bytes.length < 1024 || looksLikeHtml(seg)) {
+                        failed = true;
+                        return done({ ok: false });
+                    }
+                    size = videoSize(seg.bytes);
+                    part();
                 });
+
+                if (init) {
+                    peek(resolveUrl(res.url, init), 131072, function (head) {
+                        init_size = head ? mp4Size(head.bytes) : null;
+                        part();
+                    });
+                }
+
+                sample.forEach(function (index) {
+                    var info = segmentInfo(index);
+
+                    function add(length) {
+                        if (length > 0 && info.duration > 0.5) {
+                            bytes += length;
+                            seconds += info.duration;
+                        }
+                        part();
+                    }
+
+                    if (info.range) return add(info.range);
+                    headLength(info.url, add);
+                });
+
+                return;
             }
 
             if (res.bytes.length < 1024 || looksLikeHtml(res)) return done({ ok: false });
@@ -1746,32 +1767,44 @@
         }
 
         // Балансеры ищут по imdb и Кинопоиску, а у карточки TMDB второго нет.
-        // Сервер Lampac умеет его найти — спрашиваем первый, кто ответит.
+        // Сервер Lampac умеет его найти. Спрашиваем все серверы сразу и
+        // берём первый ответ: по очереди один лежащий сервер съедал бы
+        // секунды таймаута при каждом открытии.
         function externalIds(done) {
             var list = servers();
+            var finished = false;
+            var left = list.length;
 
-            if (movie.imdb_id && movie.kinopoisk_id) return done();
+            function finish() {
+                if (finished) return;
+                finished = true;
+                clearTimeout(timer);
+                done();
+            }
 
-            (function next(i) {
-                if (i >= list.length || destroyed) return done();
+            if ((movie.imdb_id && movie.kinopoisk_id) || !list.length) return done();
 
-                var query = ['id=' + encodeURIComponent(movie.id), 'serial=' + (serial ? 1 : 0)];
-                if (movie.imdb_id) query.push('imdb_id=' + encodeURIComponent(movie.imdb_id));
-                if (movie.kinopoisk_id) query.push('kinopoisk_id=' + encodeURIComponent(movie.kinopoisk_id));
+            var timer = setTimeout(finish, 4000);
+            var query = ['id=' + encodeURIComponent(movie.id), 'serial=' + (serial ? 1 : 0)];
+            if (movie.imdb_id) query.push('imdb_id=' + encodeURIComponent(movie.imdb_id));
+            if (movie.kinopoisk_id) query.push('kinopoisk_id=' + encodeURIComponent(movie.kinopoisk_id));
 
+            list.forEach(function (host) {
                 var ids = new Lampa.Reguest();
-                ids.timeout(8000);
-                ids.silent(account(list[i] + 'externalids?' + query.join('&')), function (json) {
+                ids.timeout(4000);
+                ids.silent(account(host + 'externalids?' + query.join('&')), function (json) {
+                    if (finished || destroyed) return;
+
                     if (json && typeof json === 'object') {
                         Object.keys(json).forEach(function (name) {
                             if (json[name]) movie[name] = json[name];
                         });
                     }
-                    done();
+                    finish();
                 }, function () {
-                    next(i + 1);
+                    if (!--left) finish();
                 });
-            })(0);
+            });
         }
 
         // confirmed — балансер сам сказал, что фильм у него есть: так отвечает
@@ -1815,8 +1848,8 @@
 
         // ----- проверка источников
 
-        var CHECK_PARALLEL = 6;
-        var PICK_GRACE = 5000;
+        var CHECK_PARALLEL = 10;
+        var PICK_GRACE = 2000;
         var MIN_QUALITY = 720;
 
         function preferredKeys() {
@@ -1837,9 +1870,17 @@
                 if (!sources[key].show || checks[key]) return;
 
                 checks[key] = 'queue';
-                // Тот, что человек выбирал, проверяем первым
-                if (preferred.indexOf(key) !== -1) check_queue.unshift(key);
-                else check_queue.push(key);
+                check_queue.push(key);
+            });
+
+            // Первыми — тот, что человек выбирал, потом те, что сервер
+            // проверил сам, и с самым высоким заявленным качеством: так
+            // первый прошедший скорее всего и будет лучшим
+            check_queue.sort(function (a, b) {
+                return ((preferred.indexOf(b) !== -1) - (preferred.indexOf(a) !== -1)) ||
+                    ((sources[b].confirmed ? 1 : 0) - (sources[a].confirmed ? 1 : 0)) ||
+                    (nameQuality(sources[b].name) - nameQuality(sources[a].name)) ||
+                    (order.indexOf(a) - order.indexOf(b));
             });
 
             runChecks();
@@ -1866,6 +1907,7 @@
                         if (!checks[key] || checks[key] === 'run') checks[key] = result ? 'ok' : 'fail';
                         if (result) verified[key] = result;
 
+                        saveChecks();
                         updateSort();
                         pick();
                         runChecks();
@@ -1874,6 +1916,62 @@
             }
 
             updateProgress();
+        }
+
+        // ----- кэш проверки
+
+        function loadChecks() {
+            var all = Lampa.Storage.get(CHECKS_KEY, '{}') || {};
+            var saved = all[movieKey()];
+
+            if (!saved || Date.now() - saved.at > CHECKS_TTL || !saved.items) return false;
+
+            var any = false;
+
+            Object.keys(saved.items).forEach(function (key) {
+                var item = saved.items[key];
+                if (!item || !item.source) return;
+
+                sources[key] = item.source;
+                if (order.indexOf(key) === -1) order.push(key);
+
+                checks[key] = item.state;
+                if (item.state === 'ok' && item.info) {
+                    item.info.cached = true;
+                    verified[key] = item.info;
+                    any = true;
+                }
+            });
+
+            order.sort(function (a, b) {
+                return (sources[a].rank - sources[b].rank) || (sources[a].at - sources[b].at);
+            });
+
+            return any;
+        }
+
+        var save_timer;
+
+        function saveChecks() {
+            clearTimeout(save_timer);
+            save_timer = setTimeout(function () {
+                var items = {};
+
+                Object.keys(checks).forEach(function (key) {
+                    var state = checks[key];
+                    if (state !== 'ok' && state !== 'fail' && state !== 'low') return;
+                    items[key] = { state: state, source: sources[key], info: verified[key] || null };
+                });
+
+                var all = Lampa.Storage.get(CHECKS_KEY, '{}') || {};
+                all[movieKey()] = { at: Date.now(), items: items };
+
+                // Держим только последние фильмы, иначе хранилище разрастётся
+                var keys = Object.keys(all).sort(function (a, b) { return (all[b].at || 0) - (all[a].at || 0); });
+                keys.slice(CHECKS_KEEP).forEach(function (k) { delete all[k]; });
+
+                Lampa.Storage.set(CHECKS_KEY, all);
+            }, 500);
         }
 
         function checkCounts() {
@@ -1894,6 +1992,8 @@
         }
 
         function updateProgress() {
+            if (sources_open) refreshSources();
+
             var counts = checkCounts();
             var loader = filter.render().find('.online-parser-loader');
 
@@ -1929,7 +2029,7 @@
                     });
                 }
 
-                net.timeout(15000);
+                net.timeout(10000);
                 net['native'](account(url), function (body) {
                     next(splitBody(body));
                 }, function () {
@@ -2020,7 +2120,7 @@
 
                 if (target.method === 'play') return verify(target);
 
-                net.timeout(15000);
+                net.timeout(10000);
                 net.silent(account(target.url), function (json) {
                     verify(json && !json.rch ? json : null);
                 }, function () {
@@ -2069,7 +2169,7 @@
                 });
             }
 
-            net.timeout(15000);
+            net.timeout(10000);
             net.silent(account(requestParams(host + 'lite/events?life=true')), function (json) {
                 if (json && json.accsdb) {
                     messages.push(json.msg);
@@ -2148,7 +2248,8 @@
         // проверяется, ждём его. Иначе — первый рабочий, не дожидаясь
         // остальных: список дополнится сам.
         function pick() {
-            if (active || destroyed) return;
+            // Человек сам выбирает в «Источнике» — не перебиваем его
+            if (active || destroyed || sources_open) return;
 
             var preferred = preferredKeys();
 
@@ -2159,6 +2260,9 @@
             }
 
             var first = nextCandidate();
+
+            // Проверено в прошлый раз — открываем сразу, ждать нечего
+            if (first && verified[first].cached && !partial(first)) return open(first, true);
 
             // Неполный сериал открываем, только когда ждать больше некого
             if (first && partial(first) && checksBusy()) return;
@@ -2171,7 +2275,7 @@
                     pick_timer = setTimeout(function () {
                         pick_timer = null;
                         var best = nextCandidate();
-                        if (!best || active) return;
+                        if (!best || active || sources_open) return;
                         if (partial(best) && checksBusy()) return;
                         open(best, true);
                     }, PICK_GRACE);
@@ -2976,20 +3080,88 @@
 
         // ----- фильтр
 
-        function updateSort() {
+        function sortItems() {
             var working = workingOrder();
             if (active && working.indexOf(active) === -1) working.unshift(active);
 
-            filter.set('sort', working.map(function (key) {
+            return working.map(function (key) {
                 return {
                     title: sourceTitle(key),
                     source: key,
                     selected: key === active,
                     ghost: checks[key] !== 'ok'
                 };
-            }));
+            });
+        }
 
+        function updateSort() {
+            filter.set('sort', sortItems());
             filter.chosen('sort', active && sources[active] ? [sourceTitle(active)] : []);
+
+            if (sources_open) refreshSources();
+        }
+
+        // «Источник» — своё меню, а не меню фильтра: оно перерисовывается,
+        // пока открыто, по мере того как проверку проходят новые источники.
+        // Фокус остаётся на том пункте, где был.
+        var sources_open = false;
+        var sources_focus = '';
+        var sources_timer;
+
+        function sourcesTitle() {
+            var counts = checkCounts();
+            return checksBusy() ? 'Источник · проверено ' + counts.done + ' из ' + counts.total : 'Источник';
+        }
+
+        function showSources() {
+            var items = sortItems();
+
+            if (!items.length) {
+                items = [{ title: checksBusy() ? 'Рабочих пока нет, проверяю…' : 'Рабочих источников нет', noenter: true, ghost: true }];
+            }
+
+            sources_open = true;
+
+            Lampa.Select.show({
+                title: sourcesTitle(),
+                items: items,
+                onFocus: function (item) {
+                    if (item.source) sources_focus = item.source;
+                },
+                onSelect: function (item) {
+                    sources_open = false;
+                    Lampa.Controller.toggle('content');
+                    if (item.source) open(item.source, false);
+                },
+                onBack: function () {
+                    sources_open = false;
+                    Lampa.Controller.toggle('content');
+                    // Закрыл, ничего не выбрав, — открываем лучший сами
+                    pick();
+                }
+            });
+
+            var index = sources_focus ? items.map(function (i) { return i.source; }).indexOf(sources_focus) : -1;
+            if (index >= 0) {
+                var node = Lampa.Select.render().find('.selectbox-item').eq(index)[0];
+                if (node) Lampa.Controller.collectionFocus(node, Lampa.Select.render());
+            }
+        }
+
+        // Не чаще раза в полсекунды — иначе при пачке результатов меню
+        // моргало бы
+        function refreshSources() {
+            if (sources_timer) return;
+
+            sources_timer = setTimeout(function () {
+                sources_timer = null;
+                if (!sources_open || destroyed) return;
+                if (!Lampa.Select.opened()) {
+                    sources_open = false;
+                    return;
+                }
+                showSources();
+            }, 500);
         }
 
         function updateFilter() {
@@ -3084,6 +3256,12 @@
             if (filter.addButtonBack) filter.addButtonBack();
 
             filter.render().find('.filter--sort span').text('Источник');
+
+            // Кнопку «Источник» ведём сами — см. showSources
+            filter.render().find('.filter--sort').off('hover:enter').on('hover:enter', function () {
+                sources_focus = active || sources_focus;
+                showSources();
+            });
         }
 
         // ----- жизненный цикл Lampa
@@ -3101,6 +3279,13 @@
 
             Lampa.Controller.enable('content');
             this.loading(false);
+
+            // Проверенное недавно — сразу в список и на экран, а серверы
+            // опрашиваются как обычно и добавят новое
+            if (loadChecks()) {
+                updateSort();
+                pick();
+            }
 
             externalIds(loadSources);
         };
@@ -3170,6 +3355,8 @@
             pollers.forEach(function (net) { net.clear(); });
             check_nets.forEach(function (net) { net.clear(); });
             timers.forEach(clearTimeout);
+            clearTimeout(sources_timer);
+            clearTimeout(save_timer);
             clearTimeout(requests_timer);
             clearImages();
             files.destroy();
