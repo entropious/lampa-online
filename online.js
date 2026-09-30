@@ -2204,7 +2204,7 @@
         }
 
         function bitrateName(bits) {
-            return bits ? (bits / 1e6).toFixed(bits >= 1e7 ? 0 : 1).replace('.', ',') + ' Мбит/с' : '';
+            return bits ? (bits / 1e6).toFixed(bits >= 1e7 ? 0 : 1) + ' mbps' : '';
         }
 
         // Ссылки из карты качеств, лучшая первой
@@ -3196,14 +3196,47 @@
     function onCard(ctx) {
         if (!Lampa.Storage.get(BUTTON_KEY, true)) return;
 
-        Core.cardButton(ctx, {
+        var button = Core.cardButton(ctx, {
             className: 'online-parser--button',
             icon: ICON,
             title: 'Онлайн',
-            // Второй в ряду, сразу за первой родной кнопкой («Смотреть»)
+            // Второй в ряду, сразу за первой кнопкой («Смотреть»)
             after: '.full-start__button',
             onEnter: function () { openOnline(ctx); }
         });
+
+        if (button) keepSecond(button);
+    }
+
+    // Другие плагины добавляют свои кнопки в тот же ряд позже и каждый в
+    // свой момент, так что вставленная один раз кнопка уезжает на случайное
+    // место. Следим за рядом и возвращаем её вторым. Не больше двадцати
+    // перестановок на карточку — на случай, если кто-то так же держит это
+    // место за собой, иначе они перетягивали бы кнопку бесконечно.
+    function keepSecond(button) {
+        var row = button.parent();
+        var moves = 0;
+
+        function place() {
+            if (!document.body.contains(button[0])) return observer && observer.disconnect();
+
+            var first = row.children('.full-start__button').not(button).not('.hide').first();
+            if (!first.length || button.prev()[0] === first[0]) return;
+            if (++moves > 20) return observer && observer.disconnect();
+
+            button.insertAfter(first);
+        }
+
+        var observer = typeof MutationObserver !== 'undefined' ? new MutationObserver(place) : null;
+
+        if (observer) observer.observe(row[0], { childList: true });
+        else {
+            // Старые телевизоры без MutationObserver: поправляем несколько
+            // раз в первые секунды, пока плагины грузятся
+            [300, 1000, 2500, 5000].forEach(function (delay) { setTimeout(place, delay); });
+        }
+
+        place();
     }
 
     function addSettings() {
