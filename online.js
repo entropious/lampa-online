@@ -3683,7 +3683,7 @@
             param: { name: TORRENT_M3U_KEY, type: 'trigger', default: true },
             field: {
                 name: 'Торренты во внешнем плеере — плейлистом',
-                description: 'IINA, mpv, VLC и nPlayer получают всю раздачу с выбранной серии, и серии можно переключать в самом плеере. Нужен TorrServer MatriX.143 или новее, чтобы плейлист начинался с выбранной серии.'
+                description: 'IINA, mpv, VLC и nPlayer получают всю раздачу с выбранной серии, и серии можно переключать в самом плеере. Для VLC и nPlayer нужен TorrServer MatriX.143 или новее.'
             }
         });
 
@@ -3714,11 +3714,58 @@
     // Торренты Lampa (через TorrServer) во внешнем плеере на macOS и iOS
     // уходят одним файлом: Lampa передаёт IINA, mpv, VLC и nPlayer только
     // ссылку, плейлист туда не попадает, и серии в плеере не переключить.
-    // Подменяем ссылку на M3U самого TorrServer — с выбранной серии до
-    // конца раздачи. index в M3U TorrServer понимает с MatriX.143, старые
-    // версии его игнорируют, поэтому добавляем fromlast и заранее отмечаем
-    // выбранную серию просмотренной: тогда и они начнут с неё.
+    // Подменяем ссылку на плейлист с выбранной серии до конца раздачи.
     var M3U_PLAYERS = ['iina', 'mpv', 'vlc', 'nplayer'];
+    // Сколько серий после выбранной класть в плейлист: ссылка на него
+    // уходит в адрес iina://, а тот не резиновый
+    var M3U_MAX = 60;
+
+    // IINA и mpv получают плейлист прямо в ссылке, через протокол mpv
+    // hex:// — сам плейлист шестнадцатеричными цифрами. M3U от TorrServer
+    // им не годится: открыв плейлист, mpv начинает не с первой строки, а с
+    // первой серии, где сохранена позиция просмотра (watch later). Ссылки
+    // на серии у TorrServer всегда одни и те же, так что недосмотренная
+    // когда-то десятая перехватывала запуск шестой. Поэтому первая серия —
+    // та самая ссылка, что выбрана (позиция внутри неё сохраняется как
+    // раньше), а у остальных в ссылке метка запуска: TorrServer её не
+    // замечает, а старые позиции mpv к ней не подходят.
+    function hexPlaylist(data, list, at) {
+        var stamp = Date.now().toString(36);
+        var lines = ['#EXTM3U'];
+
+        list.slice(at, at + M3U_MAX + 1).forEach(function (item, i) {
+            var url = Lampa.Torserver.toPlayUrl(i ? item.url : data.url).replace('&preload', '&play');
+            var title = String(item.title || item.path_human || '').replace(/[\r\n]+/g, ' ');
+
+            lines.push('#EXTINF:0,' + title);
+            lines.push(i ? url + '&launch=' + stamp : url);
+        });
+
+        var bytes = unescape(encodeURIComponent(lines.join('\n') + '\n'));
+        var hex = '';
+        for (var i = 0; i < bytes.length; i++) hex += ('0' + bytes.charCodeAt(i).toString(16)).slice(-2);
+
+        return 'hex://' + hex;
+    }
+
+    // VLC и nPlayer hex:// не знают — им M3U самого TorrServer. Начинать
+    // его с нужного файла (index) TorrServer умеет с MatriX.143.
+    function serverPlaylist(url) {
+        // …/stream/<имя файла>?link=<хэш>&index=<N>&play
+        var match = url.match(/^(.*\/stream\/)([^?]*)\?(.*)$/);
+        if (!match) return '';
+
+        var link = (match[3].match(/(?:^|&)link=([^&]+)/) || [])[1];
+        var index = (match[3].match(/(?:^|&)index=(\d+)/) || [])[1];
+        if (!link || !index) return '';
+
+        var name = decodeURIComponent(match[2]).replace(/\.[^.]+$/, '') || 'playlist';
+        return match[1] + encodeURIComponent(name) + '.m3u?link=' + link + '&index=' + index + '&m3u';
+    }
+
+    function fileIndex(url) {
+        return (String(url).match(/[?&]index=(\d+)/) || [])[1];
+    }
 
     function torrentPlaylist(data) {
         if (!Lampa.Storage.get(TORRENT_M3U_KEY, true)) return;
@@ -3728,21 +3775,22 @@
         var app = data.launch_player || Lampa.Storage.field('player_torrent');
         if (M3U_PLAYERS.indexOf(app) === -1) return;
 
-        // …/stream/<имя файла>?link=<хэш>&index=<N>&play
-        var match = data.url.match(/^(.*\/stream\/)([^?]*)\?(.*)$/);
-        if (!match) return;
+        // Плейлист раздачи Lampa собирает сама, в том порядке, что в списке
+        // файлов, — с выбранной серией внутри
+        var list = (Array.isArray(data.playlist) ? data.playlist : []).filter(function (item) {
+            return item && typeof item.url === 'string';
+        });
+        var index = fileIndex(data.url);
+        var at = -1;
+        list.forEach(function (item, i) {
+            if (at === -1 && (item.url === data.url || (index && fileIndex(item.url) === index))) at = i;
+        });
 
-        var query = match[3];
-        var link = (query.match(/(?:^|&)link=([^&]+)/) || [])[1];
-        var index = (query.match(/(?:^|&)index=(\d+)/) || [])[1];
-        if (!link || !index) return;
+        // Серия последняя или единственная — переключать нечего
+        if (at === -1 || at === list.length - 1) return;
 
-        try {
-            if (Lampa.Torserver && Lampa.Torserver.viewedSet) Lampa.Torserver.viewedSet(link, parseInt(index, 10), 0);
-        } catch (e) {}
-
-        var name = decodeURIComponent(match[2]).replace(/\.[^.]+$/, '') || 'playlist';
-        data.url = match[1] + encodeURIComponent(name) + '.m3u?link=' + link + '&index=' + index + '&m3u&fromlast';
+        var url = app === 'iina' || app === 'mpv' ? hexPlaylist(data, list, at) : serverPlaylist(data.url);
+        if (url) data.url = url;
     }
 
     function startPlugin() {
