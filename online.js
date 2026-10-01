@@ -287,9 +287,11 @@
     // открыть его мгновенно, а не ждать проверку заново
     // Номер растёт, когда меняются правила проверки: иначе полчаса
     // показывалось бы то, что по новым правилам уже не проходит
-    var CHECKS_KEY = 'online_parser_checks_v2';
+    var CHECKS_KEY = 'online_parser_checks_v3';
     var CHECKS_TTL = 30 * 60 * 1000;
     var CHECKS_KEEP = 30;
+    // Как источники проходят проверку: доля рабочих, качество и скорость
+    var SOURCE_STATS_KEY = 'online_parser_stats';
 
     // Эти ключи общие со всеми клиентами Lampac, и это полезно. uid сервер
     // привязывает к оплаченному доступу — купленный через чужой плагин премиум
@@ -442,6 +444,85 @@
 
     function serverLabel(host) {
         return host.replace(/^https?:\/\//i, '').replace(/\/+$/, '').replace(/^www\./, '');
+    }
+
+    // ----- приоритет по статистике
+
+    // Приоритет — по тому, как источник проходит проверку на всех фильмах:
+    // часто ли отдаёт видео, в каком качестве и как быстро. Статистика
+    // копится и по серверу целиком, и по каждому балансеру на нём: HDVB
+    // на одном сервере даёт 480p, на rc.bwa.ad почти всё уходит в rch и
+    // проверку не проходит. Порядок в настройках решает только при
+    // равенстве и пока истории нет. Старые результаты постепенно
+    // забываются, чтобы починенный или сломанный сервер быстро сдвинулся.
+    var source_stats = null;
+
+    function sourceStats() {
+        if (!source_stats) source_stats = Lampa.Storage.get(SOURCE_STATS_KEY, '{}') || {};
+        return source_stats;
+    }
+
+    // quality — 0, если видео не получено
+    function noteCheck(host, balanser, quality, ms) {
+        var all = sourceStats();
+
+        [host, host + '|' + balanser].forEach(function (id) {
+            var stat = all[id] || { n: 0, ok: 0, q: 0, t: 0 };
+
+            stat.n = stat.n * 0.95 + 1;
+            stat.ok = stat.ok * 0.95 + (quality ? 1 : 0);
+            stat.at = Date.now();
+            if (quality) {
+                stat.q = stat.q ? stat.q * 0.8 + quality * 0.2 : quality;
+                stat.t = stat.t ? stat.t * 0.8 + ms * 0.2 : ms;
+            }
+
+            all[id] = stat;
+        });
+
+        Lampa.Storage.set(SOURCE_STATS_KEY, all);
+    }
+
+    // Доля рабочих, качество и время: своя история, сглаженная к base —
+    // чтобы одна-две проверки не решали всё
+    function blend(stat, base) {
+        var prior = 2;
+        var n = stat ? stat.n : 0;
+
+        return {
+            rate: ((stat ? stat.ok : 0) + prior * base.rate) / (n + prior),
+            q: stat && stat.q ? stat.q : base.q,
+            t: stat && stat.t ? stat.t : base.t
+        };
+    }
+
+    // Без истории балансер считается как его сервер, а сервер — средним:
+    // половина рабочих, 1080p за 5 секунд
+    function sourceRating(host, balanser) {
+        var all = sourceStats();
+        return blend(all[host + '|' + balanser], blend(all[host], { rate: 0.5, q: 1080, t: 5000 }));
+    }
+
+    // Сколько хорошего видео в секунду проверки: доля рабочих × качество
+    // (1080p — единица) ÷ время
+    function sourceScore(host, balanser) {
+        var own = sourceRating(host, balanser);
+        return own.rate * (own.q / 1080) / (1 + own.t / 5000);
+    }
+
+    // Почти никогда не отдаёт видео — проверять незачем: так rc.bwa.ad,
+    // который отвечает первым и занимает все слоты проверки заведомыми
+    // провалами. Суждение — не меньше чем по пяти проверкам сервера и
+    // балансера вместе и не старше суток: иначе починенный сервер так
+    // никогда бы и не вернулся.
+    function hopeless(host, balanser) {
+        var all = sourceStats();
+        var server = all[host];
+        var own = all[host + '|' + balanser];
+        var fresh = (own && Date.now() - own.at < 86400000) || (server && Date.now() - server.at < 86400000);
+        var n = (server ? server.n : 0) + (own ? own.n : 0);
+
+        return !!fresh && n >= 5 && sourceRating(host, balanser).rate < 0.1;
     }
 
     function uid() {
@@ -1835,7 +1916,6 @@
         // опрос lifeevents. Сервер, отдавший список сразу, ничего не проверял,
         // и его балансеры могут оказаться пустыми.
         function addSources(host, list, confirmed) {
-            var multi = servers().length > 1;
             var direct = host === 'direct:';
             // Прямые источники — после серверов
             var rank = direct ? servers().length : servers().indexOf(host);
@@ -1852,7 +1932,7 @@
                     key: key,
                     host: host,
                     balanser: name,
-                    name: (item.name || name) + (multi && !direct ? ' · ' + serverLabel(host) : ''),
+                    name: item.name || name,
                     url: item.url,
                     show: item.show === undefined ? true : !!item.show,
                     confirmed: !!confirmed,
@@ -1861,13 +1941,22 @@
                 };
             });
 
-            // Порядок источников — порядок серверов в настройках, а не то,
-            // кто ответил первым
-            order.sort(function (a, b) {
-                return (sources[a].rank - sources[b].rank) || (sources[a].at - sources[b].at);
+            sortOrder();
+            enqueueChecks();
+        }
+
+        // Порядок источников — по статистике проверок, а не по тому, кто
+        // ответил первым
+        function sortOrder() {
+            var scores = {};
+            order.forEach(function (key) {
+                scores[key] = sourceScore(sources[key].host, sources[key].balanser);
             });
 
-            enqueueChecks();
+            order.sort(function (a, b) {
+                return (scores[b] - scores[a]) ||
+                    (sources[a].rank - sources[b].rank) || (sources[a].at - sources[b].at);
+            });
         }
 
         // ----- проверка источников
@@ -1887,23 +1976,70 @@
             return wanted.filter(function (key) { return sources[key]; });
         }
 
-        function enqueueChecks() {
+        // Один и тот же балансер приходит с нескольких серверов — HDVB с
+        // пяти, VeoVeo с четырёх, — и это одно и то же видео: VK с двух
+        // серверов совпал до бита. Поэтому балансер проверяется один раз, на
+        // первом сервере, а копии ждут в запасе ('dup'). Копию проверяем,
+        // только если первый не отдал видео: тогда виноват сервер, а не
+        // видео. Ниже 720p — это само видео, на другом сервере оно такое же.
+        function twins(key) {
+            return order.filter(function (k) { return k !== key && sources[k].balanser === sources[key].balanser; });
+        }
+
+        function covered(key) {
+            return twins(key).some(function (k) {
+                return checks[k] === 'queue' || checks[k] === 'run' || checks[k] === 'ok' || checks[k] === 'low';
+            });
+        }
+
+        // fallback — рабочих не нашлось, проверяем и безнадёжные
+        function enqueueChecks(fallback) {
             var preferred = preferredKeys();
 
-            order.forEach(function (key) {
-                if (!sources[key].show || checks[key]) return;
+            // Выбранный раньше — первым в своей группе, остальные по порядку
+            // серверов
+            var keys = order.slice().sort(function (a, b) {
+                return (preferred.indexOf(b) !== -1) - (preferred.indexOf(a) !== -1) || (order.indexOf(a) - order.indexOf(b));
+            });
+
+            // Копия с сервера выше по списку пришла, пока первая ещё ждёт в
+            // очереди, — проверяем её: сервер, ответивший первым, бывает
+            // последним по приоритету, а то и отдаёт всё через rch
+            check_queue = check_queue.filter(function (key) {
+                var better = twins(key).some(function (k) {
+                    return sources[k].show && (!checks[k] || checks[k] === 'dup') && keys.indexOf(k) < keys.indexOf(key);
+                });
+                if (better) checks[key] = 'dup';
+                return !better;
+            });
+
+            keys.forEach(function (key) {
+                if (!sources[key].show) return;
+                if (checks[key] && checks[key] !== 'dup' && !(checks[key] === 'skip' && fallback)) return;
+                if (!fallback && preferred.indexOf(key) === -1 && hopeless(sources[key].host, sources[key].balanser)) {
+                    checks[key] = 'skip';
+                    return;
+                }
+                if (covered(key)) {
+                    checks[key] = 'dup';
+                    return;
+                }
 
                 checks[key] = 'queue';
                 check_queue.push(key);
             });
 
-            // Первыми — тот, что человек выбирал, потом те, что сервер
-            // проверил сам, и с самым высоким заявленным качеством: так
-            // первый прошедший скорее всего и будет лучшим
+            // Первыми — тот, что человек выбирал, дальше по статистике; то,
+            // что сервер проверил сам, немного выше: так первый прошедший
+            // скорее всего и будет лучшим
+            var weight = {};
+            check_queue.forEach(function (key) {
+                weight[key] = sourceScore(sources[key].host, sources[key].balanser) * (sources[key].confirmed ? 1.5 : 1);
+            });
+
             check_queue.sort(function (a, b) {
                 return ((preferred.indexOf(b) !== -1) - (preferred.indexOf(a) !== -1)) ||
-                    ((sources[b].confirmed ? 1 : 0) - (sources[a].confirmed ? 1 : 0)) ||
-                    (nameQuality(sources[b].name) - nameQuality(sources[a].name)) ||
+                    (weight[b] - weight[a]) ||
                     (order.indexOf(a) - order.indexOf(b));
             });
 
@@ -1916,9 +2052,13 @@
                     check_running++;
                     checks[key] = 'run';
 
+                    var started = Date.now();
+
                     probe(key, function (result) {
                         check_running--;
                         if (destroyed) return;
+
+                        noteCheck(sources[key].host, sources[key].balanser, result ? result.quality || MIN_QUALITY : 0, Date.now() - started);
 
                         // Ниже 720p не показываем вовсе. Качество, которое не
                         // удалось узнать ни из видео, ни от балансера, не
@@ -1930,6 +2070,9 @@
 
                         if (!checks[key] || checks[key] === 'run') checks[key] = result ? 'ok' : 'fail';
                         if (result) verified[key] = result;
+
+                        // Не прошёл — пробуем ту же копию с другого сервера
+                        if (checks[key] === 'fail') enqueueChecks();
 
                         saveChecks();
                         updateSort();
@@ -1968,9 +2111,7 @@
                 }
             });
 
-            order.sort(function (a, b) {
-                return (sources[a].rank - sources[b].rank) || (sources[a].at - sources[b].at);
-            });
+            sortOrder();
 
             return any;
         }
@@ -2003,6 +2144,9 @@
             var counts = { total: 0, done: 0, ok: 0 };
 
             Object.keys(checks).forEach(function (key) {
+                // Копии с других серверов и безнадёжные не проверялись и в
+                // счёт не идут
+                if (checks[key] === 'dup' || checks[key] === 'skip') return;
                 counts.total++;
                 if (checks[key] === 'ok' || checks[key] === 'fail' || checks[key] === 'low') counts.done++;
                 if (checks[key] === 'low') counts.low = (counts.low || 0) + 1;
@@ -2281,6 +2425,9 @@
 
             if (!first) {
                 if (checksBusy()) return;
+
+                // Последняя надежда — то, что по статистике не работает
+                if (order.some(function (key) { return checks[key] === 'skip'; })) return enqueueChecks(true);
 
                 var counts = checkCounts();
                 if (messages.length && !counts.total) return message('Ничего не нашлось', messages.join('<br>'));
