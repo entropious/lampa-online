@@ -503,11 +503,14 @@
         return blend(all[host + '|' + balanser], blend(all[host], { rate: 0.5, q: 1080, t: 5000 }));
     }
 
-    // Сколько хорошего видео в секунду проверки: доля рабочих × качество
-    // (1080p — единица) ÷ время
-    function sourceScore(host, balanser) {
-        var own = sourceRating(host, balanser);
-        return own.rate * (own.q / 1080) / (1 + own.t / 5000);
+    // Сравнение источников по статистике: сначала качество, которого от
+    // них можно ждать, — доля рабочих × разрешение, с шагом в 100 строк,
+    // чтобы мелкий разброс не перебивал скорость; при равном — кто быстрее
+    function compareStats(a, b) {
+        var ra = sourceRating(a.host, a.balanser);
+        var rb = sourceRating(b.host, b.balanser);
+
+        return (Math.round(rb.rate * rb.q / 100) - Math.round(ra.rate * ra.q / 100)) || (ra.t - rb.t);
     }
 
     // Почти никогда не отдаёт видео — проверять незачем: так rc.bwa.ad,
@@ -1948,13 +1951,8 @@
         // Порядок источников — по статистике проверок, а не по тому, кто
         // ответил первым
         function sortOrder() {
-            var scores = {};
-            order.forEach(function (key) {
-                scores[key] = sourceScore(sources[key].host, sources[key].balanser);
-            });
-
             order.sort(function (a, b) {
-                return (scores[b] - scores[a]) ||
+                return compareStats(sources[a], sources[b]) ||
                     (sources[a].rank - sources[b].rank) || (sources[a].at - sources[b].at);
             });
         }
@@ -2029,17 +2027,19 @@
                 check_queue.push(key);
             });
 
-            // Первыми — тот, что человек выбирал, дальше по статистике; то,
-            // что сервер проверил сам, немного выше: так первый прошедший
-            // скорее всего и будет лучшим
-            var weight = {};
-            check_queue.forEach(function (key) {
-                weight[key] = sourceScore(sources[key].host, sources[key].balanser) * (sources[key].confirmed ? 1.5 : 1);
-            });
+            // Первыми — тот, что человек выбирал, потом копии балансеров,
+            // чья первая копия не прошла (они уже отстали), дальше по
+            // статистике; при равной — то, что сервер проверил сам: так
+            // первый прошедший скорее всего и будет лучшим
+            function retry(key) {
+                return twins(key).some(function (k) { return checks[k] === 'fail'; }) ? 1 : 0;
+            }
 
             check_queue.sort(function (a, b) {
                 return ((preferred.indexOf(b) !== -1) - (preferred.indexOf(a) !== -1)) ||
-                    (weight[b] - weight[a]) ||
+                    (retry(b) - retry(a)) ||
+                    compareStats(sources[a], sources[b]) ||
+                    ((sources[b].confirmed ? 1 : 0) - (sources[a].confirmed ? 1 : 0)) ||
                     (order.indexOf(a) - order.indexOf(b));
             });
 
