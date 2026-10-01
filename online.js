@@ -3729,13 +3729,28 @@
     // та самая ссылка, что выбрана (позиция внутри неё сохраняется как
     // раньше), а у остальных в ссылке метка запуска: TorrServer её не
     // замечает, а старые позиции mpv к ней не подходят.
+    // Подпись серии в плейлисте плеера. Lampa в title кладёт название из
+    // TMDB без номера, поэтому номер добавляем сами: «S01E06 · Название».
+    // Номера нет — имя файла, как в M3U у TorrServer.
+    function playlistTitle(item) {
+        var file = String(item.path || '').split(/[\\/]/).pop();
+        var name = String(item.fname || item.title || file || item.path_human || '');
+        var episode = parseInt(item.episode, 10);
+        var season = parseInt(item.season, 10);
+
+        function pad(n) { return (n < 10 ? '0' : '') + n; }
+
+        var title = episode ? (season ? 'S' + pad(season) : '') + 'E' + pad(episode) + (name && name !== file ? ' · ' + name : '') : '';
+        return (title || file || name).replace(/[\r\n]+/g, ' ');
+    }
+
     function hexPlaylist(data, list, at) {
         var stamp = Date.now().toString(36);
         var lines = ['#EXTM3U'];
 
         list.slice(at, at + M3U_MAX + 1).forEach(function (item, i) {
             var url = Lampa.Torserver.toPlayUrl(i ? item.url : data.url).replace('&preload', '&play');
-            var title = String(item.title || item.path_human || '').replace(/[\r\n]+/g, ' ');
+            var title = playlistTitle(item);
 
             lines.push('#EXTINF:0,' + title);
             lines.push(i ? url + '&launch=' + stamp : url);
