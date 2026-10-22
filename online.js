@@ -386,6 +386,14 @@
         /* Встроенная кнопка «Трейлеры» (YouTube). Кнопку трейлера из
            «Случайного» (.button--youtube-trailer) не трогаем. */
         body.online-parser-no-trailers .full-start__button.view--trailer { display: none !important; }
+        .online-parser-torrent-viewed {
+            position: absolute; top: 0.5em; left: 0.5em; z-index: 1; padding: 0.25em; font-size: 0.76em;
+            background: rgba(0,0,0,0.6); border-radius: 100%; pointer-events: none;
+        }
+        .online-parser-torrent-viewed > svg { width: 1.5em; height: 1.5em; display: block; }
+        .online-parser-torrent-viewed--inline {
+            position: static; display: inline-block; vertical-align: middle; margin-right: 0.5em; font-size: 0.6em;
+        }
         .online-parser-better {
             display: inline-block; margin-left: 0.5em; padding: 0.1em 0.45em; vertical-align: middle;
             font-size: 0.8em; border-radius: 0.3em; background: rgba(255,255,255,0.15); opacity: 0.8;
@@ -3744,14 +3752,13 @@
     // метка запуска: TorrServer её не замечает, а старые позиции mpv к ней
     // не подходят.
     //
-    // Выбранная серия тоже с меткой, то есть с начала: её сохранённая
-    // позиция бывает на титрах — серию закрыли в самом конце, — и тогда
-    // mpv за секунду доигрывал её и включал следующую. Позицию оставляем,
-    // только если Lampa сама знает, что серия начата и не досмотрена.
-    function hexPlaylist(data, list, at) {
+    // Выбранной серии метка нужна не всегда. Без неё mpv продолжит серию с
+    // сохранённой позиции — это и нужно, если её бросили на середине. Но
+    // позиция бывает и на титрах: серию закрыли в самом конце, и тогда mpv
+    // за секунду доигрывал её и включал следующую. Это решает resume (см.
+    // torrentPlaylist).
+    function hexPlaylist(data, list, at, resume) {
         var stamp = Date.now().toString(36);
-        var view = data.timeline || {};
-        var resume = view.percent > 0 && view.percent < 90;
         var lines = ['#EXTM3U'];
 
         list.slice(at, at + M3U_MAX + 1).forEach(function (item, i) {
@@ -3788,13 +3795,118 @@
         return (String(url).match(/[?&]index=(\d+)/) || [])[1];
     }
 
-    function torrentPlaylist(data) {
+    // ----- просмотренные серии торрента
+
+    // Какие файлы раздачи уже открывались, знает TorrServer: он отмечает
+    // файл, как только начинает его отдавать (POST /viewed, action list) —
+    // и для внешнего плеера тоже, и без TrackTimecode. Lampa в списке файлов
+    // эти отметки не рисует, рисуем сами. Адрес и пароль сервера — те же,
+    // что у Lampa: Lampa.Reguest сама подставляет авторизацию TorrServer.
+    var torrent_views = {};
+
+    function torrentState(hash) {
+        if (!torrent_views[hash]) torrent_views[hash] = { files: null, items: {}, waiting: [], loading: false, asked: false };
+        return torrent_views[hash];
+    }
+
+    // done(files) — { <индекс файла>: true } или null, если сервер не ответил
+    function loadTorrentViewed(hash, done) {
+        var state = torrentState(hash);
+        var server = Lampa.Torserver && Lampa.Torserver.url ? Lampa.Torserver.url() : '';
+
+        if (done) state.waiting.push(done);
+        if (state.loading) return;
+        if (!server) return finish(null);
+
+        state.loading = true;
+
+        var net = new Lampa.Reguest();
+        net.timeout(3000);
+        net.silent(server.replace(/\/+$/, '') + '/viewed', function (list) {
+            var files = {};
+            (Array.isArray(list) ? list : []).forEach(function (v) {
+                if (v && v.file_index !== undefined) files[v.file_index] = true;
+            });
+            finish(files);
+        }, function () {
+            finish(null);
+        }, JSON.stringify({ action: 'list', hash: hash }));
+
+        function finish(files) {
+            state.loading = false;
+            if (files) state.files = files;
+            drawTorrentViewed(hash);
+
+            var waiting = state.waiting;
+            state.waiting = [];
+            waiting.forEach(function (fn) { fn(files); });
+        }
+    }
+
+    function drawTorrentViewed(hash) {
+        var state = torrentState(hash);
+
+        Object.keys(state.items).forEach(function (id) {
+            var item = state.items[id];
+            var on = !!(state.files && state.files[id]);
+
+            item.find('.online-parser-torrent-viewed').remove();
+            if (!on) return;
+
+            if (item.hasClass('torrent-serial')) {
+                item.append('<div class="online-parser-torrent-viewed">' + VIEWED_ICON + '</div>');
+            } else {
+                item.find('.torrent-file__title').prepend('<span class="online-parser-torrent-viewed online-parser-torrent-viewed--inline">' + VIEWED_ICON + '</span>');
+            }
+        });
+    }
+
+    function torrentFileEvent(e) {
+        if (e.type === 'list_open' || e.type === 'list_close') {
+            Object.keys(torrent_views).forEach(function (hash) {
+                torrent_views[hash].items = {};
+                torrent_views[hash].asked = false;
+            });
+            return;
+        }
+
+        var element = e.element;
+        if (!element || !element.torrent_hash || !e.item) return;
+
+        var state = torrentState(element.torrent_hash);
+
+        if (e.type === 'render') {
+            state.items[element.id] = e.item;
+            if (state.files) drawTorrentViewed(element.torrent_hash);
+            // Раз на открытие списка
+            if (!state.asked) {
+                state.asked = true;
+                loadTorrentViewed(element.torrent_hash);
+            }
+        }
+
+        // TorrServer отметит файл, как только начнёт его отдавать, — не ждём
+        if (e.type === 'onenter') {
+            state.items[element.id] = e.item;
+            state.files = state.files || {};
+            state.files[element.id] = true;
+            drawTorrentViewed(element.torrent_hash);
+        }
+    }
+
+    // ----- плейлист торрента для внешнего плеера
+
+    function torrentPlaylist(data, abort) {
         if (!Lampa.Storage.get(TORRENT_M3U_KEY, true)) return;
         if (!data || !data.torrent_hash || typeof data.url !== 'string') return;
         if (!(Lampa.Platform.macOS && Lampa.Platform.macOS()) && !Lampa.Platform.is('apple')) return;
 
         var app = data.launch_player || Lampa.Storage.field('player_torrent');
         if (M3U_PLAYERS.indexOf(app) === -1) return;
+
+        // Lampa запускает тот же объект серии и в следующий раз — ссылку,
+        // подменённую прошлым запуском, возвращаем
+        if (data.online_playlist_url && data.url === data.online_playlist_url) data.url = data.online_source_url;
 
         // Плейлист раздачи Lampa собирает сама, в том порядке, что в списке
         // файлов, — с выбранной серией внутри
@@ -3810,8 +3922,42 @@
         // Серия последняя или единственная — переключать нечего
         if (at === -1 || at === list.length - 1) return;
 
-        var url = app === 'iina' || app === 'mpv' ? hexPlaylist(data, list, at) : serverPlaylist(data.url);
-        if (url) data.url = url;
+        var url;
+
+        if (app === 'iina' || app === 'mpv') {
+            // Продолжать ли выбранную серию с сохранённой позиции, решает
+            // свежий список просмотренного у TorrServer: если после неё уже
+            // открывали следующие, её досмотрели — с начала. Иначе это
+            // самая дальняя серия — продолжаем с места. Запуск ждёт ответа
+            // (до 3 секунд), потом Lampa запускает плеер заново.
+            if (!data.online_viewed && abort) {
+                abort();
+                loadTorrentViewed(data.torrent_hash, function (files) {
+                    data.online_viewed = { files: files };
+                    Lampa.Player.play(data);
+                });
+                return;
+            }
+
+            var viewed = data.online_viewed && data.online_viewed.files;
+            delete data.online_viewed;
+
+            var later = !!viewed && list.slice(at + 1).some(function (item) {
+                return viewed[fileIndex(item.url)];
+            });
+            var view = data.timeline || {};
+            var resume = (view.percent > 0 && view.percent < 90) || !later;
+
+            url = hexPlaylist(data, list, at, resume);
+        } else {
+            url = serverPlaylist(data.url);
+        }
+
+        if (url) {
+            data.online_source_url = data.url;
+            data.online_playlist_url = url;
+            data.url = url;
+        }
     }
 
     function startPlugin() {
@@ -3820,8 +3966,9 @@
         applyTrailers();
 
         Lampa.Player.listener.follow('create', function (e) {
-            torrentPlaylist(e.data);
+            torrentPlaylist(e.data, e.abort);
         });
+        Lampa.Listener.follow('torrent_file', torrentFileEvent);
 
         Lampa.Storage.listener.follow('change', function (e) {
             if (e.name === TRAILERS_KEY) applyTrailers();
