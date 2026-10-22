@@ -387,9 +387,14 @@
            «Случайного» (.button--youtube-trailer) не трогаем. */
         body.online-parser-no-trailers .full-start__button.view--trailer { display: none !important; }
         .online-parser-torrent-viewed {
-            position: absolute; top: 0.5em; left: 0.5em; z-index: 1; padding: 0.25em; font-size: 0.76em;
+            position: absolute; bottom: 0.5em; left: 0.5em; z-index: 1; padding: 0.25em; font-size: 0.76em;
             background: rgba(0,0,0,0.6); border-radius: 100%; pointer-events: none;
         }
+        .online-parser-torrent-viewed--badge {
+            position: static; display: inline-block; vertical-align: -0.1em; margin-left: 0.3em;
+            padding: 0; font-size: 0.75em; background: none;
+        }
+        .online-parser-torrent-viewed--badge > svg { width: 1em; height: 1em; }
         .online-parser-torrent-viewed > svg { width: 1.5em; height: 1.5em; display: block; }
         .online-parser-torrent-viewed--inline {
             position: static; display: inline-block; vertical-align: middle; margin-right: 0.5em; font-size: 0.6em;
@@ -3853,7 +3858,13 @@
             item.find('.online-parser-torrent-viewed').remove();
             if (!on) return;
 
-            if (item.hasClass('torrent-serial')) {
+            // У серии в углу картинки уже стоит номер от Lampa — галочку
+            // ставим в тот же бейдж, рядом с цифрой
+            var badge = item.find('.torrent-serial__episode');
+
+            if (badge.length && $.trim(badge.text())) {
+                badge.append('<span class="online-parser-torrent-viewed online-parser-torrent-viewed--badge">' + VIEWED_ICON + '</span>');
+            } else if (item.hasClass('torrent-serial')) {
                 item.append('<div class="online-parser-torrent-viewed">' + VIEWED_ICON + '</div>');
             } else {
                 item.find('.torrent-file__title').prepend('<span class="online-parser-torrent-viewed online-parser-torrent-viewed--inline">' + VIEWED_ICON + '</span>');
