@@ -3725,6 +3725,44 @@
         $('body').toggleClass('online-parser-no-trailers', hide);
     }
 
+    // «Смотреть» на карточке открывает меню из кнопок скрытого ряда
+    // (.buttons--container): торренты, трейлеры, кнопки плагинов. Если
+    // кнопка одна, Lampa сразу её нажимает, но считает она всё без класса
+    // hide — в том числе спрятанное стилями, как «Трейлеры» выше. Тогда в
+    // меню один пункт, а меню всё равно открывается. Перед показом этого
+    // меню убираем невидимые пункты, а единственный оставшийся нажимаем
+    // сами.
+    function playMenu() {
+        if (!Lampa.Select || !Lampa.Select.show || Lampa.Select.show.online_parser) return;
+
+        var show = Lampa.Select.show;
+        var wrapped = function (params) {
+            var items = params && Array.isArray(params.items) ? params.items : null;
+            var buttons = items && items.length && items.every(function (item) {
+                return item && item.btn && item.btn.length && item.btn.closest('.buttons--container').length;
+            });
+
+            if (buttons) {
+                var visible = items.filter(function (item) {
+                    var node = item.btn[0];
+                    return getComputedStyle(node).display !== 'none' && $.trim(item.btn.text());
+                });
+
+                if (visible.length === 1) {
+                    visible[0].btn.trigger('hover:enter');
+                    return;
+                }
+
+                if (visible.length && visible.length < items.length) params.items = visible;
+            }
+
+            return show.apply(this, arguments);
+        };
+
+        wrapped.online_parser = true;
+        Lampa.Select.show = wrapped;
+    }
+
     // Торренты Lampa (через TorrServer) во внешнем плеере на macOS и iOS
     // уходят одним файлом: Lampa передаёт IINA, mpv, VLC и nPlayer только
     // ссылку, плейлист туда не попадает, и серии в плеере не переключить.
@@ -4076,6 +4114,7 @@
         addTemplates();
         addSettings();
         applyTrailers();
+        playMenu();
 
         Lampa.Player.listener.follow('create', function (e) {
             torrentPlaylist(e.data, e.abort);
