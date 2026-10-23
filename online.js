@@ -281,6 +281,7 @@
     var RCH_KEY = 'online_parser_rch';
     var TRAILERS_KEY = 'online_parser_hide_trailers';
     var TORRENT_M3U_KEY = 'online_parser_torrent_m3u';
+    var AUTOSTART_KEY = 'online_parser_torrent_autostart';
     var CHOICE_KEY = 'online_parser_choice';
     var LAST_SOURCE_KEY = 'online_parser_source';
     // Результаты проверки источников по каждому фильму — чтобы повторно
@@ -3810,7 +3811,7 @@
     var torrent_views = {};
 
     function torrentState(hash) {
-        if (!torrent_views[hash]) torrent_views[hash] = { files: null, items: {}, waiting: [], loading: false, asked: false };
+        if (!torrent_views[hash]) torrent_views[hash] = { files: null, items: {}, order: [], waiting: [], loading: false, asked: false };
         return torrent_views[hash];
     }
 
@@ -3876,8 +3877,10 @@
         if (e.type === 'list_open' || e.type === 'list_close') {
             Object.keys(torrent_views).forEach(function (hash) {
                 torrent_views[hash].items = {};
+                torrent_views[hash].order = [];
                 torrent_views[hash].asked = false;
             });
+            stopAutostart();
             return;
         }
 
@@ -3888,21 +3891,119 @@
 
         if (e.type === 'render') {
             state.items[element.id] = e.item;
+            state.order.push(element.id);
             if (state.files) drawTorrentViewed(element.torrent_hash);
             // Раз на открытие списка
             if (!state.asked) {
                 state.asked = true;
-                loadTorrentViewed(element.torrent_hash);
+                planAutostart(element.torrent_hash);
+                loadTorrentViewed(element.torrent_hash, function (files) {
+                    runAutostart(element.torrent_hash, files);
+                });
             }
         }
 
         // TorrServer отметит файл, как только начнёт его отдавать, — не ждём
         if (e.type === 'onenter') {
+            stopAutostart();
             state.items[element.id] = e.item;
             state.files = state.files || {};
             state.files[element.id] = true;
             drawTorrentViewed(element.torrent_hash);
         }
+    }
+
+    // ----- автостарт недосмотренной серии
+
+    // Открыл торрент сериала — сразу запускается серия, на которой
+    // остановился: самая дальняя из тех, что TorrServer уже отдавал. Это
+    // она и есть — с плейлистом плеер сам идёт по сериям дальше, так что
+    // самая дальняя открытая — та, на которой закрыли плеер. IINA и mpv
+    // продолжат её с места (см. torrentPlaylist). Ничего не открывали —
+    // ничего и не запускаем. Любая клавиша, пока ждём ответа TorrServer,
+    // запуск отменяет — как у родного автостарта Lampa для одного файла.
+    // Выключается переключателем «Автостарт» на экране торрентов.
+    var autostart_hash = '';
+
+    function autostartKey() {
+        stopAutostart();
+    }
+
+    function planAutostart(hash) {
+        stopAutostart();
+        if (!Lampa.Storage.get(AUTOSTART_KEY, true)) return;
+
+        autostart_hash = hash;
+        if (Lampa.Keypad && Lampa.Keypad.listener) Lampa.Keypad.listener.follow('keydown', autostartKey);
+    }
+
+    function stopAutostart() {
+        autostart_hash = '';
+        if (Lampa.Keypad && Lampa.Keypad.listener) Lampa.Keypad.listener.remove('keydown', autostartKey);
+    }
+
+    function runAutostart(hash, files) {
+        if (autostart_hash !== hash) return;
+        stopAutostart();
+
+        var state = torrentState(hash);
+        // Один файл Lampa запускает сама, своим автостартом
+        if (!files || state.order.length < 2) return;
+
+        var target = null;
+        state.order.forEach(function (id) {
+            if (files[id]) target = id;
+        });
+        if (target === null || !state.items[target]) return;
+
+        var item = state.items[target];
+        // Список ещё не на экране — запускать нечего
+        if (!item.closest('body').length) return;
+
+        item.trigger('hover:enter');
+    }
+
+    // Переключатель на экране со списком торрентов, рядом с «Фильтром»
+    function autostartButton(render) {
+        if (!render || !render.length || render.find('.online-parser-autostart').length) return false;
+
+        var anchor = render.find('.filter--filter').last();
+        if (!anchor.length) anchor = render.find('.filter--sort').last();
+        if (!anchor.length) return false;
+
+        var button = $('<div class="simple-button simple-button--filter selector online-parser-autostart"><span>Автостарт</span><div></div></div>');
+
+        function draw() {
+            button.find('div').text(Lampa.Storage.get(AUTOSTART_KEY, true) ? 'вкл' : 'выкл');
+        }
+
+        // Строкой: false Storage.get с умолчанием true прочитает как true
+        button.on('hover:enter', function () {
+            Lampa.Storage.set(AUTOSTART_KEY, Lampa.Storage.get(AUTOSTART_KEY, true) ? 'false' : 'true');
+            draw();
+        });
+
+        draw();
+        button.insertAfter(anchor);
+
+        var enabled = Lampa.Controller.enabled && Lampa.Controller.enabled();
+        if (enabled && enabled.name === 'content' && Lampa.Controller.collectionAppend) Lampa.Controller.collectionAppend(button);
+
+        return true;
+    }
+
+    function torrentsActivity(e) {
+        if (e.type !== 'start' || e.component !== 'torrents' || !e.object || !e.object.activity) return;
+
+        var render = $(e.object.activity.render());
+        if (autostartButton(render) || typeof MutationObserver === 'undefined') return;
+
+        // Фильтр появляется, когда пришли результаты поиска
+        var observer = new MutationObserver(function () {
+            if (autostartButton(render)) observer.disconnect();
+        });
+        observer.observe(render[0], { childList: true, subtree: true });
+        setTimeout(function () { observer.disconnect(); }, 120000);
     }
 
     // ----- плейлист торрента для внешнего плеера
@@ -3980,6 +4081,7 @@
             torrentPlaylist(e.data, e.abort);
         });
         Lampa.Listener.follow('torrent_file', torrentFileEvent);
+        Lampa.Listener.follow('activity', torrentsActivity);
 
         Lampa.Storage.listener.follow('change', function (e) {
             if (e.name === TRAILERS_KEY) applyTrailers();
