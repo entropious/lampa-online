@@ -4175,6 +4175,18 @@
         try { api.plugins(finish); } catch (e) { finish([]); }
     }
 
+    // Куда вернуть фокус после меню импорта и экспорта. Запоминать
+    // «текущий контроллер» нельзя: сразу после ввода ссылки им ещё числится
+    // закрытая клавиатура, и Lampa падала, пытаясь вернуться в неё. Поэтому
+    // — всегда на страницу расширений, её же контроллером, а если она уже
+    // закрыта — на основной экран.
+    var extensions_page = null;
+
+    function backToExtensions() {
+        if (extensions_page && document.body.contains(extensions_page.render(true))) Lampa.Controller.toggle('extensions');
+        else Lampa.Controller.toggle('content');
+    }
+
     function pluginUrl(plugin) {
         return String(typeof plugin === 'string' ? plugin : (plugin && plugin.url) || '').trim();
     }
@@ -4334,7 +4346,6 @@
     }
 
     function confirmImport(wanted, cub, page) {
-        var controller = Lampa.Controller.enabled().name;
         var diff = pluginsDiff(wanted, cub);
         var cub_on = diff.cub.filter(function (change) { return change.status; }).length;
         var cub_off = diff.cub.length - cub_on;
@@ -4357,11 +4368,11 @@
                 items: [{ title: 'Перезапустить Lampa', reload: true }, { title: 'Позже' }],
                 onSelect: function (item) {
                     if (item.reload) return window.location.reload();
-                    Lampa.Controller.toggle(controller);
+                    backToExtensions();
                     extensionsReload(page);
                 },
                 onBack: function () {
-                    Lampa.Controller.toggle(controller);
+                    backToExtensions();
                     extensionsReload(page);
                 }
             });
@@ -4385,12 +4396,12 @@
             title: 'Импорт: в файле ' + wanted.length,
             items: items,
             onSelect: function (item) {
-                Lampa.Controller.toggle(controller);
+                backToExtensions();
                 if (item.full) done(applyPlugins(diff, true));
                 else if (item.add) done(applyPlugins(diff, false));
             },
             onBack: function () {
-                Lampa.Controller.toggle(controller);
+                backToExtensions();
             }
         });
     }
@@ -4399,6 +4410,10 @@
         var saved = Lampa.Storage.get(EXT_SYNC_URL_KEY, '') + '';
 
         Lampa.Input.edit({ title: 'Ссылка на md-файл', value: saved, free: true, nosave: true, nomic: true }, function (url) {
+            // Клавиатура Lampa после ввода уводит фокус в настройки под
+            // страницей расширений
+            backToExtensions();
+
             url = String(url || '').trim();
             if (!url) return;
             if (!/^https?:\/\//i.test(url)) return Lampa.Noty.show('Нужна ссылка http или https');
@@ -4489,7 +4504,6 @@
     }
 
     function syncMenu(kind, page) {
-        var controller = Lampa.Controller.enabled().name;
         var saved = Lampa.Storage.get(EXT_SYNC_URL_KEY, '') + '';
 
         // Список аккаунта — заранее, пока открыто меню: копировать в буфер
@@ -4522,11 +4536,11 @@
             title: kind === 'import' ? 'Импорт расширений' : 'Экспорт расширений',
             items: items,
             onSelect: function (item) {
-                Lampa.Controller.toggle(controller);
+                backToExtensions();
                 item.run();
             },
             onBack: function () {
-                Lampa.Controller.toggle(controller);
+                backToExtensions();
             }
         });
     }
@@ -4554,6 +4568,7 @@
 
     function extensionsOpen(e) {
         var page = e && e.extensions;
+        extensions_page = page || null;
         if (!page || syncTiles(page) || typeof MutationObserver === 'undefined') return;
 
         // Ряд «Установленные» появляется, когда загрузится список
@@ -4577,7 +4592,10 @@
         });
         Lampa.Listener.follow('torrent_file', torrentFileEvent);
         Lampa.Listener.follow('activity', torrentsActivity);
-        if (Lampa.Extensions && Lampa.Extensions.listener) Lampa.Extensions.listener.follow('open', extensionsOpen);
+        if (Lampa.Extensions && Lampa.Extensions.listener) {
+            Lampa.Extensions.listener.follow('open', extensionsOpen);
+            Lampa.Extensions.listener.follow('close', function () { extensions_page = null; });
+        }
 
         Lampa.Storage.listener.follow('change', function (e) {
             if (e.name === TRAILERS_KEY) applyTrailers();
