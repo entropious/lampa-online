@@ -280,6 +280,7 @@
     var BUTTON_KEY = 'online_parser_button';
     var RCH_KEY = 'online_parser_rch';
     var TRAILERS_KEY = 'online_parser_hide_trailers';
+    var SUBSCRIBE_KEY = 'online_parser_no_subscribe';
     var TORRENT_M3U_KEY = 'online_parser_torrent_m3u';
     var AUTOSTART_KEY = 'online_parser_torrent_autostart';
     var CHOICE_KEY = 'online_parser_choice';
@@ -387,6 +388,9 @@
         /* Встроенная кнопка «Трейлеры» (YouTube). Кнопку трейлера из
            «Случайного» (.button--youtube-trailer) не трогаем. */
         body.online-parser-no-trailers .full-start__button.view--trailer { display: none !important; }
+        /* Подписки: кнопки на карточке сериала и на странице актёра, пункт меню */
+        body.online-parser-no-subscribe .full-start__button.button--subscribe,
+        body.online-parser-no-subscribe .menu__item[data-action="subscribes"] { display: none !important; }
         .online-parser-torrent-viewed {
             position: absolute; bottom: 0.5em; left: 0.5em; z-index: 1; padding: 0.25em; font-size: 0.76em;
             background: rgba(0,0,0,0.6); border-radius: 100%; pointer-events: none;
@@ -3694,6 +3698,15 @@
 
         Lampa.SettingsApi.addParam({
             component: 'online_parser',
+            param: { name: SUBSCRIBE_KEY, type: 'trigger', default: true },
+            field: {
+                name: 'Отключить подписки',
+                description: 'Кнопки «Подписаться» на карточке сериала и на странице актёра, пункт «Подписки» в меню'
+            }
+        });
+
+        Lampa.SettingsApi.addParam({
+            component: 'online_parser',
             param: { name: TORRENT_M3U_KEY, type: 'trigger', default: true },
             field: {
                 name: 'Торренты во внешнем плеере — плейлистом',
@@ -3723,6 +3736,23 @@
         }
 
         $('body').toggleClass('online-parser-no-trailers', hide);
+    }
+
+    // Подписки целиком: на озвучку сериала (кнопка на карточке и пункт
+    // «Подписки» в меню) и на актёра (кнопка на его странице). Флаг Lampa
+    // disable_features.subscribe убирает первые два, но меню Lampa
+    // собирает на старте, часто раньше плагина, а актёров флаг не
+    // касается, — поэтому ещё и стилями. Невидимое пульт пропускает, как
+    // и родной класс hide; выключил настройку — всё вернулось без
+    // перезапуска.
+    function applySubscribe() {
+        var hide = !!Lampa.Storage.get(SUBSCRIBE_KEY, true);
+
+        if (window.lampa_settings && window.lampa_settings.disable_features) {
+            window.lampa_settings.disable_features.subscribe = hide;
+        }
+
+        $('body').toggleClass('online-parser-no-subscribe', hide);
     }
 
     // «Смотреть» на карточке открывает меню из кнопок скрытого ряда
@@ -4114,6 +4144,7 @@
         addTemplates();
         addSettings();
         applyTrailers();
+        applySubscribe();
         playMenu();
 
         Lampa.Player.listener.follow('create', function (e) {
@@ -4124,6 +4155,7 @@
 
         Lampa.Storage.listener.follow('change', function (e) {
             if (e.name === TRAILERS_KEY) applyTrailers();
+            if (e.name === SUBSCRIBE_KEY) applySubscribe();
         });
 
         Lampa.Component.add(COMPONENT, OnlineComponent);
