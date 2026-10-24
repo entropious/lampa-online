@@ -4140,6 +4140,431 @@
         }
     }
 
+    // ----- импорт и экспорт списка расширений
+
+    // Список расширений, добавленных вручную (Настройки → Расширения), —
+    // в md-файл и обратно, чтобы держать один список на всех устройствах.
+    // Формат — список задач markdown, по строке на расширение:
+    //   - [x] [Название](https://…/plugin.js)   включено
+    //   - [ ] https://…/plugin.js                выключено
+    // Порядок строк — порядок загрузки. При импорте берётся любая строка с
+    // http-ссылкой, так что файл можно вести и руками.
+    //
+    // В файле все расширения: и добавленные на устройстве, и из аккаунта
+    // CUB (отдельным разделом). У аккаунта Lampa умеет только включать и
+    // выключать (Account.Api.pluginToggle) — добавить или удалить там
+    // можно лишь на сайте CUB. Поэтому при импорте ссылка из аккаунта
+    // меняет статус там, новая ссылка добавляется на устройство, а плагин
+    // аккаунта, которого нет в файле, при полной синхронизации
+    // выключается.
+    var EXT_SYNC_URL_KEY = 'online_parser_ext_sync_url';
+
+    // Плагины аккаунта CUB; без входа — пусто
+    function cubPlugins(done) {
+        var api = Lampa.Account && Lampa.Account.Api;
+        if (!api || !api.plugins) return done([]);
+
+        var finished = false;
+        function finish(list) {
+            if (finished) return;
+            finished = true;
+            done((Array.isArray(list) ? list : []).filter(function (plugin) { return pluginUrl(plugin); }));
+        }
+
+        setTimeout(function () { finish([]); }, 5000);
+        try { api.plugins(finish); } catch (e) { finish([]); }
+    }
+
+    function pluginUrl(plugin) {
+        return String(typeof plugin === 'string' ? plugin : (plugin && plugin.url) || '').trim();
+    }
+
+    function pluginOn(plugin) {
+        return typeof plugin === 'string' || !!(plugin && plugin.status);
+    }
+
+    function pluginsMarkdown(cub) {
+        var lines = ['# Расширения Lampa', '', '<!-- [x] — включено, [ ] — выключено. Порядок строк — порядок загрузки. -->'];
+        var seen = {};
+
+        function section(title, list) {
+            var rows = [];
+
+            list.forEach(function (plugin) {
+                var url = pluginUrl(plugin);
+                if (!url || seen[url]) return;
+                seen[url] = true;
+
+                var name = String((plugin && plugin.name) || '').replace(/[\[\]\r\n]+/g, ' ').trim();
+                rows.push('- [' + (pluginOn(plugin) ? 'x' : ' ') + '] ' + (name ? '[' + name + '](' + url + ')' : url));
+            });
+
+            if (!rows.length) return;
+            lines.push('', '## ' + title, '');
+            lines.push.apply(lines, rows);
+        }
+
+        section('Установленные', Lampa.Plugins.get());
+        section('Аккаунт CUB', cub || []);
+
+        return lines.join('\n') + '\n';
+    }
+
+    // [{ url, status, name }] в порядке файла, без повторов
+    function parsePluginsMarkdown(text) {
+        var seen = {};
+        var list = [];
+
+        String(text || '').split(/\r?\n/).forEach(function (line) {
+            var match = line.match(/https?:\/\/[^\s<>()\[\]"'`]+/);
+            if (!match) return;
+
+            var url = match[0].replace(/[.,;:!?]+$/, '');
+            if (seen[url]) return;
+            seen[url] = true;
+
+            var named = line.match(/\[([^\]]+)\]\(\s*https?:\/\//);
+            var item = { url: url, status: /^\s*(?:[-*+]|\d+[.)])\s*\[\s\]/.test(line) ? 0 : 1 };
+            if (named && !/^\s*[xX ]?\s*$/.test(named[1])) item.name = named[1].trim();
+
+            list.push(item);
+        });
+
+        return list;
+    }
+
+    function pluginsDiff(wanted, cub) {
+        var current = Lampa.Plugins.get();
+        var by_url = {};
+        current.forEach(function (plugin) { by_url[pluginUrl(plugin)] = plugin; });
+
+        var cub_url = {};
+        cub.forEach(function (plugin) { cub_url[pluginUrl(plugin)] = plugin; });
+
+        var want_url = {};
+        wanted.forEach(function (item) { want_url[item.url] = item; });
+
+        // Что в аккаунте CUB, решается там: на устройство не добавляем
+        var local = wanted.filter(function (item) { return !cub_url[item.url]; });
+
+        return {
+            wanted: local,
+            add: local.filter(function (item) { return !by_url[item.url]; }),
+            remove: current.filter(function (plugin) { return !want_url[pluginUrl(plugin)] || cub_url[pluginUrl(plugin)]; }),
+            toggle: local.filter(function (item) {
+                var have = by_url[item.url];
+                return have && pluginOn(have) !== !!item.status;
+            }),
+            // [{ plugin, status }]: включить или выключить в аккаунте
+            cub: cub.map(function (plugin) {
+                var item = want_url[pluginUrl(plugin)];
+                return { plugin: plugin, status: item ? !!item.status : false, listed: !!item };
+            }).filter(function (change) {
+                return change.status !== pluginOn(change.plugin);
+            })
+        };
+    }
+
+    function applyCub(changes, full) {
+        var restart = false;
+
+        changes.forEach(function (change) {
+            // Только добавление: того, чего нет в файле, не касаемся
+            if (!full && !change.listed) return;
+
+            change.plugin.status = change.status ? 1 : 0;
+            try { Lampa.Account.Api.pluginToggle(change.plugin, change.plugin.status); } catch (e) {}
+
+            if (change.status) Lampa.Plugins.push(change.plugin);
+            else restart = true;
+        });
+
+        return restart;
+    }
+
+    // full — привести список к файлу целиком, иначе только добавить новые.
+    // Новые включённые Lampa загружает сразу (Plugins.add), а удалённые и
+    // выключенные уже работают до перезапуска.
+    function applyPlugins(diff, full) {
+        var current = Lampa.Plugins.get();
+        var by_url = {};
+        current.forEach(function (plugin) { by_url[pluginUrl(plugin)] = plugin; });
+
+        var cub_restart = applyCub(diff.cub, full);
+
+        if (!full) {
+            diff.add.forEach(function (item) { Lampa.Plugins.add(item); });
+            return cub_restart;
+        }
+
+        // Порядок — как в файле: вынимаем всех и добавляем заново. Уже
+        // загруженные Lampa повторно не грузит.
+        current.forEach(function (plugin) { Lampa.Plugins.remove(plugin); });
+        diff.wanted.forEach(function (item) {
+            var have = by_url[item.url];
+            var plugin = have && typeof have === 'object' ? have : { url: item.url };
+
+            plugin.status = item.status ? 1 : 0;
+            if (item.name && !plugin.name) plugin.name = item.name;
+            Lampa.Plugins.add(plugin);
+        });
+        Lampa.Plugins.save();
+
+        return cub_restart || diff.remove.some(pluginOn) || diff.toggle.some(function (item) { return !item.status; });
+    }
+
+    function extensionsReload(page) {
+        if (page && page.onBack) {
+            page.onBack();
+            setTimeout(function () { Lampa.Extensions.show(); }, 50);
+        }
+    }
+
+    function importPlugins(text, page) {
+        var wanted = parsePluginsMarkdown(text);
+
+        if (!wanted.length) {
+            Lampa.Noty.show('В файле нет ссылок на расширения');
+            return;
+        }
+
+        cubPlugins(function (cub) {
+            confirmImport(wanted, cub, page);
+        });
+    }
+
+    function confirmImport(wanted, cub, page) {
+        var controller = Lampa.Controller.enabled().name;
+        var diff = pluginsDiff(wanted, cub);
+        var cub_on = diff.cub.filter(function (change) { return change.status; }).length;
+        var cub_off = diff.cub.length - cub_on;
+        var cub_listed = diff.cub.filter(function (change) { return change.listed; }).length;
+        var changes = diff.add.length + diff.remove.length + diff.toggle.length + diff.cub.length;
+
+        if (!changes) {
+            Lampa.Noty.show('Список уже совпадает с файлом: ' + wanted.length);
+            return;
+        }
+
+        function done(restart) {
+            if (!restart) {
+                Lampa.Noty.show('Готово');
+                return extensionsReload(page);
+            }
+
+            Lampa.Select.show({
+                title: 'Удалённые и выключенные отключатся после перезапуска',
+                items: [{ title: 'Перезапустить Lampa', reload: true }, { title: 'Позже' }],
+                onSelect: function (item) {
+                    if (item.reload) return window.location.reload();
+                    Lampa.Controller.toggle(controller);
+                    extensionsReload(page);
+                },
+                onBack: function () {
+                    Lampa.Controller.toggle(controller);
+                    extensionsReload(page);
+                }
+            });
+        }
+
+        var parts = [];
+        if (diff.add.length) parts.push('добавить ' + diff.add.length);
+        if (diff.remove.length) parts.push('удалить ' + diff.remove.length);
+        if (diff.toggle.length) parts.push('переключить ' + diff.toggle.length);
+        if (cub_on) parts.push('в CUB включить ' + cub_on);
+        if (cub_off) parts.push('в CUB выключить ' + cub_off);
+
+        var items = [{ title: 'Синхронизировать', subtitle: parts.join(', '), full: true }];
+        var partial = diff.add.length + cub_listed;
+        if (partial && partial < changes) {
+            items.push({ title: 'Только добавить новые', subtitle: 'добавить ' + diff.add.length + (cub_listed ? ', в CUB переключить ' + cub_listed : ''), add: true });
+        }
+        items.push({ title: 'Отмена' });
+
+        Lampa.Select.show({
+            title: 'Импорт: в файле ' + wanted.length,
+            items: items,
+            onSelect: function (item) {
+                Lampa.Controller.toggle(controller);
+                if (item.full) done(applyPlugins(diff, true));
+                else if (item.add) done(applyPlugins(diff, false));
+            },
+            onBack: function () {
+                Lampa.Controller.toggle(controller);
+            }
+        });
+    }
+
+    function importFromUrl(page) {
+        var saved = Lampa.Storage.get(EXT_SYNC_URL_KEY, '') + '';
+
+        Lampa.Input.edit({ title: 'Ссылка на md-файл', value: saved, free: true, nosave: true, nomic: true }, function (url) {
+            url = String(url || '').trim();
+            if (!url) return;
+            if (!/^https?:\/\//i.test(url)) return Lampa.Noty.show('Нужна ссылка http или https');
+
+            Lampa.Storage.set(EXT_SYNC_URL_KEY, url);
+
+            var net = new Lampa.Reguest();
+            net.timeout(15000);
+            // Чтобы не взять файл из кэша после правки
+            net['native'](url + (url.indexOf('?') === -1 ? '?' : '&') + '_=' + Date.now(), function (text) {
+                importPlugins(text, page);
+            }, function () {
+                Lampa.Noty.show('Не удалось загрузить файл');
+            }, false, { dataType: 'text' });
+        });
+    }
+
+    function importFromFile(page) {
+        var input = document.createElement('input');
+        input.type = 'file';
+        input.accept = '.md,.markdown,.txt,text/markdown,text/plain';
+        input.style.display = 'none';
+
+        input.addEventListener('change', function () {
+            var file = input.files && input.files[0];
+            input.remove();
+            if (!file) return;
+
+            var reader = new FileReader();
+            reader.onload = function () { importPlugins(reader.result, page); };
+            reader.onerror = function () { Lampa.Noty.show('Не удалось прочитать файл'); };
+            reader.readAsText(file);
+        });
+
+        document.body.appendChild(input);
+        input.click();
+    }
+
+    function importFromClipboard(page) {
+        if (!navigator.clipboard || !navigator.clipboard.readText) return Lampa.Noty.show('Буфер обмена недоступен');
+
+        navigator.clipboard.readText().then(function (text) {
+            importPlugins(text, page);
+        })['catch'](function () {
+            Lampa.Noty.show('Нет доступа к буферу обмена');
+        });
+    }
+
+    function copyText(text) {
+        function fallback() {
+            var area = document.createElement('textarea');
+            area.value = text;
+            area.style.position = 'fixed';
+            area.style.opacity = '0';
+            document.body.appendChild(area);
+            area.select();
+            var ok = false;
+            try { ok = document.execCommand('copy'); } catch (e) {}
+            area.remove();
+            Lampa.Noty.show(ok ? 'Скопировано' : 'Не удалось скопировать');
+        }
+
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+            navigator.clipboard.writeText(text).then(function () {
+                Lampa.Noty.show('Скопировано');
+            })['catch'](fallback);
+        } else {
+            fallback();
+        }
+    }
+
+    function downloadText(text, name) {
+        try {
+            var blob = new Blob([text], { type: 'text/markdown;charset=utf-8' });
+            var link = document.createElement('a');
+            link.href = URL.createObjectURL(blob);
+            link.download = name;
+            link.style.display = 'none';
+            document.body.appendChild(link);
+            link.click();
+            setTimeout(function () {
+                URL.revokeObjectURL(link.href);
+                link.remove();
+            }, 1000);
+        } catch (e) {
+            Lampa.Noty.show('Не удалось сохранить файл');
+        }
+    }
+
+    function syncMenu(kind, page) {
+        var controller = Lampa.Controller.enabled().name;
+        var saved = Lampa.Storage.get(EXT_SYNC_URL_KEY, '') + '';
+
+        // Список аккаунта — заранее, пока открыто меню: копировать в буфер
+        // браузер разрешает только сразу после нажатия, ждать сеть там
+        // нельзя
+        var cub = null;
+        var cub_waiting = [];
+        if (kind === 'export') {
+            cubPlugins(function (list) {
+                cub = list;
+                cub_waiting.forEach(function (fn) { fn(list); });
+            });
+        }
+
+        function withCub(fn) {
+            if (cub) fn(cub);
+            else cub_waiting.push(fn);
+        }
+
+        var items = kind === 'import' ? [
+            { title: 'По ссылке', subtitle: saved || 'например, raw-ссылка на файл в GitHub', run: function () { importFromUrl(page); } },
+            { title: 'Из файла', run: function () { importFromFile(page); } },
+            { title: 'Из буфера обмена', run: function () { importFromClipboard(page); } }
+        ] : [
+            { title: 'Скачать файл', subtitle: 'lampa-extensions.md', run: function () { withCub(function (list) { downloadText(pluginsMarkdown(list), 'lampa-extensions.md'); }); } },
+            { title: 'Скопировать', run: function () { withCub(function (list) { copyText(pluginsMarkdown(list)); }); } }
+        ];
+
+        Lampa.Select.show({
+            title: kind === 'import' ? 'Импорт расширений' : 'Экспорт расширений',
+            items: items,
+            onSelect: function (item) {
+                Lampa.Controller.toggle(controller);
+                item.run();
+            },
+            onBack: function () {
+                Lampa.Controller.toggle(controller);
+            }
+        });
+    }
+
+    // Плитки «Импорт» и «Экспорт» рядом с «Добавить плагин»
+    function syncTiles(page) {
+        var render = $(page.render ? page.render(true) : null);
+        var add = render.find('.extensions__block-add').first();
+        if (!add.length || render.find('.online-parser-sync').length) return !!add.length;
+
+        var tiles = [['import', 'Импорт'], ['export', 'Экспорт']].map(function (spec) {
+            var tile = $('<div class="extensions__block-add selector online-parser-sync"></div>').text(spec[1]);
+            tile[0].addEventListener('hover:enter', function () { syncMenu(spec[0], page); });
+            return tile[0];
+        });
+
+        add.after(tiles);
+
+        // Ряд уже собран для пульта — добавляем плитки в его навигацию
+        var enabled = Lampa.Controller.enabled();
+        if (enabled && enabled.name === 'extensions_line' && Lampa.Controller.collectionAppend) Lampa.Controller.collectionAppend(tiles);
+
+        return true;
+    }
+
+    function extensionsOpen(e) {
+        var page = e && e.extensions;
+        if (!page || syncTiles(page) || typeof MutationObserver === 'undefined') return;
+
+        // Ряд «Установленные» появляется, когда загрузится список
+        var root = page.render(true);
+        var observer = new MutationObserver(function () {
+            if (syncTiles(page)) observer.disconnect();
+        });
+        observer.observe(root, { childList: true, subtree: true });
+        setTimeout(function () { observer.disconnect(); }, 60000);
+    }
+
     function startPlugin() {
         addTemplates();
         addSettings();
@@ -4152,6 +4577,7 @@
         });
         Lampa.Listener.follow('torrent_file', torrentFileEvent);
         Lampa.Listener.follow('activity', torrentsActivity);
+        if (Lampa.Extensions && Lampa.Extensions.listener) Lampa.Extensions.listener.follow('open', extensionsOpen);
 
         Lampa.Storage.listener.follow('change', function (e) {
             if (e.name === TRAILERS_KEY) applyTrailers();
