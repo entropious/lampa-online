@@ -251,6 +251,64 @@
 
     var COMPONENT = 'online_parser';
 
+    // ----- реклама Lampa
+
+    // Рекламу Lampa показывает в двух местах: ролик перед запуском плеера
+    // (Preroll, VAST) и баннер поверх видео во встроенном плеере, раз в 20
+    // минут. Оба берут список роликов у CUB запросом /api/ad/get/preroll
+    // и /api/ad/get/banner — при старте Lampa и потом раз в час. Отвечаем
+    // на них пустым списком: тогда Preroll сразу запускает видео, без
+    // заставки «Реклама», а баннеру нечего показать.
+    //
+    // Ставится при загрузке скрипта, а не на старте плагина: менеджеры
+    // рекламы Lampa создаёт уже после загрузки плагинов (startApp →
+    // AdManager.init), и первый запрос должен попасть сюда. Поэтому и
+    // настройка читается прямо из localStorage — Lampa.Storage ещё может
+    // быть не готов. Выключил — подействует после перезапуска.
+    (function blockAds() {
+        var enabled = true;
+        try { enabled = window.localStorage.getItem('online_parser_no_ads') !== 'false'; } catch (e) {}
+        if (!enabled || typeof XMLHttpRequest === 'undefined' || XMLHttpRequest.prototype.online_parser_noads) return;
+
+        var proto = XMLHttpRequest.prototype;
+        var open = proto.open;
+        var send = proto.send;
+
+        proto.online_parser_noads = true;
+
+        proto.open = function (method, url) {
+            this.online_parser_ad = /\/api\/ad\/get\//.test(String(url));
+            return open.apply(this, arguments);
+        };
+
+        proto.send = function () {
+            if (!this.online_parser_ad) return send.apply(this, arguments);
+
+            var xhr = this;
+            var body = '{"ad":[]}';
+
+            try {
+                Object.defineProperty(xhr, 'readyState', { value: 4 });
+                Object.defineProperty(xhr, 'status', { value: 200 });
+                Object.defineProperty(xhr, 'responseText', { value: body });
+                Object.defineProperty(xhr, 'response', { value: body });
+            } catch (e) {
+                return send.apply(this, arguments);
+            }
+
+            // Событие load вызывает и обработчик onload — отдельно не зовём
+            setTimeout(function () {
+                try {
+                    xhr.dispatchEvent(new Event('readystatechange'));
+                    xhr.dispatchEvent(new Event('load'));
+                    xhr.dispatchEvent(new Event('loadend'));
+                } catch (e) {
+                    if (typeof xhr.onload === 'function') xhr.onload();
+                }
+            }, 0);
+        };
+    })();
+
     // Своих парсеров у плагина нет, и это сознательно. Балансеры (Rezka,
     // Collaps, HDVB, VideoDB, Zetflix и прочие) закрыты CORS, прячут потоки за
     // токенами и шифрованием и меняют их каждые пару недель — в браузере
@@ -281,6 +339,7 @@
     var RCH_KEY = 'online_parser_rch';
     var TRAILERS_KEY = 'online_parser_hide_trailers';
     var SUBSCRIBE_KEY = 'online_parser_no_subscribe';
+    var NO_ADS_KEY = 'online_parser_no_ads';
     var TORRENT_M3U_KEY = 'online_parser_torrent_m3u';
     var AUTOSTART_KEY = 'online_parser_torrent_autostart';
     var CHOICE_KEY = 'online_parser_choice';
@@ -3698,6 +3757,15 @@
 
         Lampa.SettingsApi.addParam({
             component: 'online_parser',
+            param: { name: NO_ADS_KEY, type: 'trigger', default: true },
+            field: {
+                name: 'Отключить рекламу Lampa',
+                description: 'Ролик перед видео и баннер во время просмотра, в том числе от других плагинов. Включение и выключение — после перезапуска Lampa'
+            }
+        });
+
+        Lampa.SettingsApi.addParam({
+            component: 'online_parser',
             param: { name: SUBSCRIBE_KEY, type: 'trigger', default: true },
             field: {
                 name: 'Отключить подписки',
@@ -3736,6 +3804,25 @@
         }
 
         $('body').toggleClass('online-parser-no-trailers', hide);
+    }
+
+    // Рекламу подкладывают и онлайн-плагины: ссылка на VAST в данных запуска
+    // (vast_url — ролик перед видео, vast_banner — баннер поверх). Lampa
+    // показывает её даже без рекламы CUB — убираем ещё до запуска.
+    function stripAds(data) {
+        if (!data || !Lampa.Storage.get(NO_ADS_KEY, true)) return;
+
+        Object.keys(data).forEach(function (key) {
+            if (/^vast_/.test(key)) delete data[key];
+        });
+
+        // В плейлисте у следующих серий — то же самое
+        (Array.isArray(data.playlist) ? data.playlist : []).forEach(function (item) {
+            if (!item || typeof item !== 'object') return;
+            Object.keys(item).forEach(function (key) {
+                if (/^vast_/.test(key)) delete item[key];
+            });
+        });
     }
 
     // Подписки целиком: на озвучку сериала (кнопка на карточке и пункт
@@ -4588,6 +4675,7 @@
         playMenu();
 
         Lampa.Player.listener.follow('create', function (e) {
+            stripAds(e.data);
             torrentPlaylist(e.data, e.abort);
         });
         Lampa.Listener.follow('torrent_file', torrentFileEvent);
