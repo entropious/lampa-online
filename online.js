@@ -3419,6 +3419,8 @@
                 items = [{ title: checksBusy() ? 'Рабочих пока нет, проверяю…' : 'Рабочих источников нет', noenter: true, ghost: true }];
             }
 
+            items.push({ title: 'Перепроверить источники', subtitle: 'Заново опросить серверы и проверить видео', recheck: true });
+
             sources_open = true;
 
             Lampa.Select.show({
@@ -3430,6 +3432,7 @@
                 onSelect: function (item) {
                     sources_open = false;
                     Lampa.Controller.toggle('content');
+                    if (item.recheck) return recheck();
                     if (item.source) open(item.source, false);
                 },
                 onBack: function () {
@@ -3445,6 +3448,23 @@
                 var node = Lampa.Select.render().find('.selectbox-item').eq(index)[0];
                 if (node) Lampa.Controller.collectionFocus(node, Lampa.Select.render());
             }
+        }
+
+        // Проверка запоминается на 30 минут — за это время источник мог
+        // ожить, умереть или появиться новый. Забываем её для этого фильма и
+        // открываем экран заново: серверы опрашиваются, всё проверяется с
+        // нуля. Выбранные источник, озвучка и сезон хранятся отдельно и
+        // остаются.
+        function recheck() {
+            var all = Lampa.Storage.get(CHECKS_KEY, '{}') || {};
+            delete all[movieKey()];
+            Lampa.Storage.set(CHECKS_KEY, all);
+
+            var params = {};
+            Object.keys(object).forEach(function (key) {
+                if (key !== 'activity') params[key] = object[key];
+            });
+            Lampa.Activity.replace(params);
         }
 
         // Не чаще раза в полсекунды — иначе при пачке результатов меню
