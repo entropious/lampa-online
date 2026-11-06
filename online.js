@@ -340,6 +340,7 @@
     var TRAILERS_KEY = 'online_parser_hide_trailers';
     var SUBSCRIBE_KEY = 'online_parser_no_subscribe';
     var NO_ADS_KEY = 'online_parser_no_ads';
+    var HISTORY_FULL_KEY = 'online_parser_history_full';
     var TORRENT_M3U_KEY = 'online_parser_torrent_m3u';
     var AUTOSTART_KEY = 'online_parser_torrent_autostart';
     var CHOICE_KEY = 'online_parser_choice';
@@ -3777,6 +3778,15 @@
 
         Lampa.SettingsApi.addParam({
             component: 'online_parser',
+            param: { name: HISTORY_FULL_KEY, type: 'trigger', default: true },
+            field: {
+                name: 'История: сразу открывать карточку',
+                description: 'Без боковой панели с прогрессом, которую «История» с синхронизацией CUB показывает по нажатию'
+            }
+        });
+
+        Lampa.SettingsApi.addParam({
+            component: 'online_parser',
             param: { name: NO_ADS_KEY, type: 'trigger', default: true },
             field: {
                 name: 'Отключить рекламу Lampa',
@@ -3829,6 +3839,29 @@
     // Рекламу подкладывают и онлайн-плагины: ссылка на VAST в данных запуска
     // (vast_url — ролик перед видео, vast_banner — баннер поверх). Lampa
     // показывает её даже без рекламы CUB — убираем ещё до запуска.
+    // «История» при синхронизации с CUB — экран watch_history, и OK на
+    // карточке там открывает боковую панель с прогрессом и просмотрами по
+    // дням, а не саму карточку. Настройки у Lampa на это нет. Нажатие
+    // (hover:enter) не всплывает, но фазу перехвата проходит — ловим его
+    // на document раньше обработчика карточки и открываем карточку, как в
+    // прежней истории.
+    function historyEnter(e) {
+        if (!Lampa.Storage.get(HISTORY_FULL_KEY, true)) return;
+
+        var active = Lampa.Activity.active();
+        if (!active || active.component !== 'watch_history') return;
+
+        var node = e.target && e.target.closest ? e.target.closest('.card') : null;
+        var card = node && node.card_data;
+        if (!card || !card.id || !card.watch_history) return;
+
+        e.stopImmediatePropagation();
+        e.preventDefault();
+
+        if (Lampa.Router && Lampa.Router.call) Lampa.Router.call('full', card);
+        else Lampa.Activity.push({ url: card.url, component: 'full', id: card.id, method: card.name ? 'tv' : 'movie', card: card, source: card.source || 'tmdb' });
+    }
+
     function stripAds(data) {
         if (!data || !Lampa.Storage.get(NO_ADS_KEY, true)) return;
 
@@ -4699,6 +4732,7 @@
             torrentPlaylist(e.data, e.abort);
         });
         Lampa.Listener.follow('torrent_file', torrentFileEvent);
+        document.addEventListener('hover:enter', historyEnter, true);
         Lampa.Listener.follow('activity', torrentsActivity);
         if (Lampa.Extensions && Lampa.Extensions.listener) {
             Lampa.Extensions.listener.follow('open', extensionsOpen);
