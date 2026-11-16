@@ -3836,6 +3836,53 @@
         $('body').toggleClass('online-parser-no-trailers', hide);
     }
 
+    // ----- продолжение с места во встроенном плеере
+
+    // Lampa продолжает с сохранённого места, только если до конца больше
+    // 10%, иначе начинает сначала, а перематывает не ближе 15 секунд к
+    // концу. Правило другое: всегда с места, а если место у самого конца —
+    // за 30 секунд до конца. Решение Lampa не трогаем (её «Начать с …?»,
+    // «всегда сначала» в настройках работают как работали), а сразу после
+    // него, на первом timeupdate, перематываем сами.
+    var END_GAP = 30;
+    var resume_pending = null;
+
+    function resumeStart(data) {
+        resume_pending = null;
+
+        var timeline = data && data.timeline;
+        if (!timeline || Lampa.Storage.field('player_timecode') === 'again') return;
+
+        var duration = Number(timeline.duration) || 0;
+        var time = Number(timeline.time) || 0;
+
+        // Сохранённое место запоминаем сейчас: дальше Lampa пишет в
+        // timeline текущее время
+        if (timeline.percent >= 90 || (duration && time > duration - END_GAP)) {
+            resume_pending = { timeline: timeline, time: time, percent: Number(timeline.percent) || 0 };
+        }
+    }
+
+    function resumeTime(e) {
+        var pending = resume_pending;
+        if (!pending || !e || !e.duration) return;
+
+        var timeline = pending.timeline;
+        // Ждём, пока Lampa решит: спросила и ждёт ответа — ещё рано
+        if (timeline.waiting_for_user || !timeline.continued) return;
+
+        resume_pending = null;
+
+        // «Нет» на «Начать с …?»
+        if (timeline.continued_bloc) return;
+        if (e.duration <= END_GAP * 4) return;
+
+        var end = e.duration - END_GAP;
+        var target = pending.time > 0 && pending.time < e.duration ? pending.time : e.duration * pending.percent / 100;
+
+        Lampa.PlayerVideo.to(Math.max(0, Math.min(target, end)));
+    }
+
     // Рекламу подкладывают и онлайн-плагины: ссылка на VAST в данных запуска
     // (vast_url — ролик перед видео, vast_banner — баннер поверх). Lampa
     // показывает её даже без рекламы CUB — убираем ещё до запуска.
@@ -3977,29 +4024,29 @@
     // на серии у TorrServer всегда одни и те же, так что недосмотренная
     // когда-то десятая перехватывала запуск шестой.
     //
-    // Позицию mpv хранит по ссылке серии, поэтому ссылки решают всё (см.
-    // resume в torrentPlaylist):
-    // - продолжение — выбрана самая дальняя из открытых серий: ссылки у
-    //   всех серий постоянные, без меток. Позиция, сохранённая, когда серия
-    //   шла в плейлисте следом за другой, находится и при запуске её самой;
-    //   а перехватить запуск некому — дальше выбранной ничего не открывали;
-    // - пересмотр — после выбранной уже открывали следующие: у всех серий
-    //   метка запуска. TorrServer её не замечает, а старые позиции mpv к ней
-    //   не подходят: всё с начала и без перескоков, в том числе на серию,
-    //   закрытую на титрах, которую mpv за секунду доигрывал бы.
+    // Позицию mpv хранит по ссылке серии, поэтому ссылки решают всё:
+    // - выбранная серия — всегда постоянная ссылка: mpv продолжит её с
+    //   сохранённого места, смотрели её или нет;
+    // - следующие, которые ещё не открывали (по отметкам TorrServer), —
+    //   тоже постоянные: позиции у них нет, перехватывать нечем, а если
+    //   серия начнётся следом и её бросят, позиция сохранится по той же
+    //   ссылке, что и при запуске её самой;
+    // - следующие, которые уже открывали, — с меткой запуска: у них может
+    //   быть сохранённая позиция, и mpv перескочил бы на них.
     // Раньше метка стояла у следующих серий всегда, и позиция серии,
-    // начатой следом за другой, сохранялась под одноразовой ссылкой —
-    // открытая потом сама, серия шла с начала.
-    function hexPlaylist(data, list, at, resume) {
+    // начатой следом за другой, сохранялась под одноразовой ссылкой.
+    // viewed — { <индекс файла>: true } от TorrServer или null
+    function hexPlaylist(data, list, at, viewed) {
         var stamp = Date.now().toString(36);
         var lines = ['#EXTM3U'];
 
         list.slice(at, at + M3U_MAX + 1).forEach(function (item, i) {
             var url = Lampa.Torserver.toPlayUrl(i ? item.url : data.url).replace('&preload', '&play');
             var title = playlistTitle(item);
+            var opened = i && viewed && viewed[fileIndex(item.url)];
 
             lines.push('#EXTINF:0,' + title);
-            lines.push(resume ? url : url + '&launch=' + stamp);
+            lines.push(opened ? url + '&launch=' + stamp : url);
         });
 
         var bytes = unescape(encodeURIComponent(lines.join('\n') + '\n'));
@@ -4311,11 +4358,10 @@
         var url;
 
         if (app === 'iina' || app === 'mpv') {
-            // Продолжать ли выбранную серию с сохранённой позиции, решает
-            // свежий список просмотренного у TorrServer: если после неё уже
-            // открывали следующие, её досмотрели — с начала. Иначе это
-            // самая дальняя серия — продолжаем с места. Запуск ждёт ответа
-            // (до 3 секунд), потом Lampa запускает плеер заново.
+            // Каким следующим сериям нужна метка, решает свежий список
+            // открытого у TorrServer (см. hexPlaylist). Запуск ждёт ответа
+            // (до 3 секунд), потом Lampa запускает плеер заново; не ответил
+            // — меток нет.
             if (!data.online_viewed && abort) {
                 abort();
                 loadTorrentViewed(data.torrent_hash, function (files) {
@@ -4328,12 +4374,7 @@
             var viewed = data.online_viewed && data.online_viewed.files;
             delete data.online_viewed;
 
-            var later = !!viewed && list.slice(at + 1).some(function (item) {
-                return viewed[fileIndex(item.url)];
-            });
-            var resume = !later;
-
-            url = hexPlaylist(data, list, at, resume);
+            url = hexPlaylist(data, list, at, viewed || null);
         } else {
             url = serverPlaylist(data.url);
         }
@@ -4797,6 +4838,8 @@
             torrentPlaylist(e.data, e.abort);
         });
         Lampa.Listener.follow('torrent_file', torrentFileEvent);
+        Lampa.Player.listener.follow('start', resumeStart);
+        if (Lampa.PlayerVideo && Lampa.PlayerVideo.listener) Lampa.PlayerVideo.listener.follow('timeupdate', resumeTime);
         document.addEventListener('hover:enter', historyEnter, true);
         Lampa.Listener.follow('activity', torrentsActivity);
         if (Lampa.Extensions && Lampa.Extensions.listener) {
