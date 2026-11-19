@@ -340,6 +340,7 @@
     var TRAILERS_KEY = 'online_parser_hide_trailers';
     var SUBSCRIBE_KEY = 'online_parser_no_subscribe';
     var NO_ADS_KEY = 'online_parser_no_ads';
+    var NOTICE_KEY = 'online_parser_no_notice';
     var HISTORY_FULL_KEY = 'online_parser_history_full';
     var TORRENT_M3U_KEY = 'online_parser_torrent_m3u';
     var AUTOSTART_KEY = 'online_parser_torrent_autostart';
@@ -451,6 +452,8 @@
         /* Подписки: кнопки на карточке сериала и на странице актёра, пункт меню */
         body.online-parser-no-subscribe .full-start__button.button--subscribe,
         body.online-parser-no-subscribe .menu__item[data-action="subscribes"] { display: none !important; }
+        /* Колокольчик уведомлений в шапке */
+        body.online-parser-no-notice .head .notice--icon { display: none !important; }
         .online-parser-torrent-viewed {
             position: absolute; bottom: 0.5em; left: 0.5em; z-index: 1; padding: 0.25em; font-size: 0.76em;
             background: rgba(0,0,0,0.6); border-radius: 100%; pointer-events: none;
@@ -3805,6 +3808,15 @@
 
         Lampa.SettingsApi.addParam({
             component: 'online_parser',
+            param: { name: NOTICE_KEY, type: 'trigger', default: true },
+            field: {
+                name: 'Скрыть уведомления',
+                description: 'Колокольчик в шапке'
+            }
+        });
+
+        Lampa.SettingsApi.addParam({
+            component: 'online_parser',
             param: { name: TORRENT_M3U_KEY, type: 'trigger', default: true },
             field: {
                 name: 'Торренты во внешнем плеере — плейлистом',
@@ -3942,6 +3954,12 @@
         $('body').toggleClass('online-parser-no-subscribe', hide);
     }
 
+    // Колокольчик уведомлений Lampa ставит в шапку всегда, настройки для
+    // него нет — прячем стилями. Невидимое пульт пропускает.
+    function applyNotice() {
+        $('body').toggleClass('online-parser-no-notice', !!Lampa.Storage.get(NOTICE_KEY, true));
+    }
+
     // «Смотреть» на карточке открывает меню из кнопок скрытого ряда
     // (.buttons--container): торренты, трейлеры, кнопки плагинов. Если
     // кнопка одна, Lampa сразу её нажимает, но считает она всё без класса
@@ -3955,6 +3973,18 @@
         var show = Lampa.Select.show;
         var wrapped = function (params) {
             var items = params && Array.isArray(params.items) ? params.items : null;
+
+            // Свои пункты в чужих меню (например, меню серии торрента):
+            // onSelect там Lampa, и наших флагов она не знает — действие
+            // пункта зовём после её обработчика
+            if (items && items.some(function (item) { return item && typeof item.online_action === 'function'; })) {
+                var select = params.onSelect;
+                params.onSelect = function (item) {
+                    var result = select ? select.apply(this, arguments) : undefined;
+                    if (item && typeof item.online_action === 'function') item.online_action();
+                    return result;
+                };
+            }
 
             var buttons = items && items.length && items.every(function (item) {
                 return item && item.btn && item.btn.length && item.btn.closest('.buttons--container').length;
@@ -4111,6 +4141,27 @@
         }
     }
 
+    // file_index -1 при снятии — все файлы раздачи
+    function setTorrentViewed(hash, index, on) {
+        var state = torrentState(hash);
+        var server = Lampa.Torserver && Lampa.Torserver.url ? Lampa.Torserver.url() : '';
+        if (!server) return;
+
+        var net = new Lampa.Reguest();
+        net.timeout(5000);
+        net.silent(server.replace(/\/+$/, '') + '/viewed', function () {
+            if (index === -1) state.files = {};
+            else {
+                state.files = state.files || {};
+                if (on) state.files[index] = true;
+                else delete state.files[index];
+            }
+            drawTorrentViewed(hash);
+        }, function () {
+            Lampa.Noty.show('TorrServer не ответил');
+        }, JSON.stringify({ action: on ? 'set' : 'rem', hash: hash, file_index: index }), { dataType: 'text' });
+    }
+
     function drawTorrentViewed(hash) {
         var state = torrentState(hash);
 
@@ -4133,17 +4184,6 @@
                 item.find('.torrent-file__title').prepend('<span class="online-parser-torrent-viewed online-parser-torrent-viewed--inline">' + VIEWED_ICON + '</span>');
             }
         });
-    }
-
-    // Отметки меняет и Simkl — из меню серии торрента
-    function torrentViewedEvent(e) {
-        if (!e || !e.hash || !torrent_views[e.hash]) return;
-
-        var state = torrent_views[e.hash];
-        state.files = state.files || {};
-        if (e.on) state.files[e.index] = true;
-        else delete state.files[e.index];
-        drawTorrentViewed(e.hash);
     }
 
     function torrentFileEvent(e) {
@@ -4172,6 +4212,32 @@
                 planAutostart(element.torrent_hash);
                 loadTorrentViewed(element.torrent_hash, function (files) {
                     runAutostart(element.torrent_hash, files);
+                });
+            }
+        }
+
+        // Меню серии (долгое нажатие): снять или поставить отметку TorrServer.
+        // По отметкам выбирается серия для автостарта и решается, продолжать
+        // ли серию с места, — лишние, например от запуска не той серии,
+        // иначе не убрать.
+        if (e.type === 'onlong' && Array.isArray(e.menu)) {
+            var hash = element.torrent_hash;
+            var on = !!(state.files && state.files[element.id]);
+
+            e.menu.push({
+                title: on ? 'Отметить непросмотренной' : 'Отметить просмотренной',
+                subtitle: 'Отметка TorrServer',
+                online_action: function () {
+                    setTorrentViewed(hash, element.id, !on);
+                }
+            });
+
+            if (state.files && Object.keys(state.files).length) {
+                e.menu.push({
+                    title: 'Снять отметки со всех серий',
+                    online_action: function () {
+                        setTorrentViewed(hash, -1, false);
+                    }
                 });
             }
         }
@@ -4783,6 +4849,7 @@
         addSettings();
         applyTrailers();
         applySubscribe();
+        applyNotice();
         playMenu();
 
         Lampa.Player.listener.follow('create', function (e) {
@@ -4790,7 +4857,6 @@
             torrentPlaylist(e.data, e.abort);
         });
         Lampa.Listener.follow('torrent_file', torrentFileEvent);
-        Lampa.Listener.follow('torrent_viewed', torrentViewedEvent);
         Lampa.Player.listener.follow('start', resumeStart);
         if (Lampa.PlayerVideo && Lampa.PlayerVideo.listener) Lampa.PlayerVideo.listener.follow('timeupdate', resumeTime);
         document.addEventListener('hover:enter', historyEnter, true);
@@ -4803,6 +4869,7 @@
         Lampa.Storage.listener.follow('change', function (e) {
             if (e.name === TRAILERS_KEY) applyTrailers();
             if (e.name === SUBSCRIBE_KEY) applySubscribe();
+            if (e.name === NOTICE_KEY) applyNotice();
         });
 
         Lampa.Component.add(COMPONENT, OnlineComponent);
