@@ -341,6 +341,7 @@
     var SUBSCRIBE_KEY = 'online_parser_no_subscribe';
     var NO_ADS_KEY = 'online_parser_no_ads';
     var NOTICE_KEY = 'online_parser_no_notice';
+    var HEAD_HIDDEN_KEY = 'online_parser_head_hidden';
     var HISTORY_FULL_KEY = 'online_parser_history_full';
     var TORRENT_M3U_KEY = 'online_parser_torrent_m3u';
     var AUTOSTART_KEY = 'online_parser_torrent_autostart';
@@ -452,8 +453,8 @@
         /* Подписки: кнопки на карточке сериала и на странице актёра, пункт меню */
         body.online-parser-no-subscribe .full-start__button.button--subscribe,
         body.online-parser-no-subscribe .menu__item[data-action="subscribes"] { display: none !important; }
-        /* Колокольчик уведомлений в шапке */
-        body.online-parser-no-notice .head .notice--icon { display: none !important; }
+        /* Элементы шапки, скрытые в настройке «Элементы шапки» */
+        .head .online-parser-head-hidden { display: none !important; }
         .online-parser-torrent-viewed {
             position: absolute; bottom: 0.5em; left: 0.5em; z-index: 1; padding: 0.25em; font-size: 0.76em;
             background: rgba(0,0,0,0.6); border-radius: 100%; pointer-events: none;
@@ -3808,11 +3809,12 @@
 
         Lampa.SettingsApi.addParam({
             component: 'online_parser',
-            param: { name: NOTICE_KEY, type: 'trigger', default: true },
+            param: { name: HEAD_HIDDEN_KEY + '_menu', type: 'button' },
             field: {
-                name: 'Скрыть уведомления',
-                description: 'Колокольчик в шапке'
-            }
+                name: 'Элементы шапки',
+                description: 'Отметить, какие значки скрыть: уведомления, промо, поиск и любые другие, в том числе от плагинов'
+            },
+            onChange: headMenu
         });
 
         Lampa.SettingsApi.addParam({
@@ -3954,10 +3956,128 @@
         $('body').toggleClass('online-parser-no-subscribe', hide);
     }
 
-    // Колокольчик уведомлений Lampa ставит в шапку всегда, настройки для
-    // него нет — прячем стилями. Невидимое пульт пропускает.
-    function applyNotice() {
-        $('body').toggleClass('online-parser-no-notice', !!Lampa.Storage.get(NOTICE_KEY, true));
+    // Элементы шапки. Своих настроек у них в Lampa нет: колокольчик
+    // уведомлений она ставит всегда, промо вроде «Чёрной пятницы» CUB
+    // подгружает отдельным скриптом на время акции, свои значки добавляют
+    // плагины. Поэтому скрываем любые: у каждого значка ключ из его классов
+    // (без общих и состояний вроде focus), а если классов нет — из иконки
+    // или текста. Скрытые помечаются классом, невидимое пульт пропускает.
+    // Новые значки ловим наблюдателем — промо приезжает позже плагина.
+    var HEAD_NAMES = {
+        'notice--icon': 'Уведомления',
+        'black-friday__button': 'Промо «Чёрная пятница»',
+        'open--search': 'Поиск',
+        'open--settings': 'Настройки',
+        'open--profile': 'Профиль',
+        'open--friends': 'Друзья',
+        'open--broadcast': 'Трансляция на другое устройство',
+        'open--premium': 'Премиум',
+        'open--feed': 'Лента',
+        'full--screen': 'Полный экран',
+        'watch-history__filter': 'Фильтр «Истории»'
+    };
+    var HEAD_DEFAULT = ['notice--icon', 'black-friday__button'];
+    var HEAD_GENERIC = ['head__action', 'head__settings', 'selector', 'focus', 'hover', 'hide', 'online-parser-head-hidden'];
+
+    function headKey(node) {
+        var classes = String(node.className && node.className.baseVal !== undefined ? node.className.baseVal : node.className || '')
+            .split(/\s+/).filter(function (c) { return c && HEAD_GENERIC.indexOf(c) < 0 && c.indexOf('--') !== 0; }).sort();
+
+        if (classes.length) return classes.join(' ');
+
+        var use = node.querySelector && node.querySelector('use');
+        var href = use && (use.getAttribute('xlink:href') || use.getAttribute('href'));
+        if (href) return 'icon ' + href;
+
+        var text = (node.textContent || '').replace(/\s+/g, ' ').trim();
+        if (text) return 'text ' + text.slice(0, 40);
+
+        var html = node.innerHTML || '', hash = 0;
+        for (var i = 0; i < html.length; i++) hash = (hash * 31 + html.charCodeAt(i)) | 0;
+        return 'html ' + (hash >>> 0).toString(36);
+    }
+
+    function headName(key, node) {
+        if (HEAD_NAMES[key]) return HEAD_NAMES[key];
+        var text = node ? (node.textContent || '').replace(/\s+/g, ' ').trim() : '';
+        return text ? text.slice(0, 40) : key;
+    }
+
+    function headHidden() {
+        var list = Lampa.Storage.get(HEAD_HIDDEN_KEY, '');
+
+        if (!Array.isArray(list)) {
+            // Первый запуск: скрываем уведомления и промо, но кто выключал
+            // прежнюю настройку «Скрыть уведомления», тем колокольчик оставляем
+            var notice = Lampa.Storage.get(NOTICE_KEY, 'true');
+            list = HEAD_DEFAULT.filter(function (key) {
+                return !(key === 'notice--icon' && (notice === false || notice === 'false'));
+            });
+        }
+
+        return list;
+    }
+
+    function headItems() {
+        var actions = document.querySelector('.head .head__actions');
+        return actions ? Array.prototype.slice.call(actions.children) : [];
+    }
+
+    function applyHead() {
+        var hidden = headHidden();
+
+        headItems().forEach(function (node) {
+            var hide = hidden.indexOf(headKey(node)) >= 0;
+            if (node.classList.contains('online-parser-head-hidden') !== hide) node.classList.toggle('online-parser-head-hidden', hide);
+        });
+    }
+
+    function watchHead() {
+        applyHead();
+
+        var actions = document.querySelector('.head .head__actions');
+        if (!actions) return;
+
+        if (typeof MutationObserver !== 'undefined') {
+            new MutationObserver(applyHead).observe(actions, { childList: true, subtree: true, attributes: true, attributeFilter: ['class'] });
+        } else {
+            setInterval(applyHead, 2000);
+        }
+    }
+
+    function headMenu() {
+        var hidden = headHidden();
+        var seen = {};
+        var items = [];
+
+        headItems().forEach(function (node) {
+            var key = headKey(node);
+            if (seen[key]) return;
+            seen[key] = true;
+            items.push({ title: headName(key, node), key: key, checkbox: true, checked: hidden.indexOf(key) >= 0 });
+        });
+
+        // Скрытые, которых сейчас в шапке нет (промо кончилось, значок
+        // появляется только на карточке) — чтобы их можно было вернуть
+        hidden.forEach(function (key) {
+            if (seen[key]) return;
+            seen[key] = true;
+            items.push({ title: headName(key), subtitle: 'Сейчас в шапке нет', key: key, checkbox: true, checked: true });
+        });
+
+        var enabled = Lampa.Controller.enabled().name;
+
+        Lampa.Select.show({
+            title: 'Скрыть в шапке',
+            items: items,
+            onCheck: function () {
+                Lampa.Storage.set(HEAD_HIDDEN_KEY, items.filter(function (item) { return item.checked; }).map(function (item) { return item.key; }));
+                applyHead();
+            },
+            onBack: function () {
+                Lampa.Controller.toggle(enabled);
+            }
+        });
     }
 
     // «Смотреть» на карточке открывает меню из кнопок скрытого ряда
@@ -4801,7 +4921,7 @@
         addSettings();
         applyTrailers();
         applySubscribe();
-        applyNotice();
+        watchHead();
         playMenu();
 
         Lampa.Player.listener.follow('create', function (e) {
@@ -4822,7 +4942,6 @@
         Lampa.Storage.listener.follow('change', function (e) {
             if (e.name === TRAILERS_KEY) applyTrailers();
             if (e.name === SUBSCRIBE_KEY) applySubscribe();
-            if (e.name === NOTICE_KEY) applyNotice();
         });
 
         Lampa.Component.add(COMPONENT, OnlineComponent);
