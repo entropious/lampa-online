@@ -3977,7 +3977,10 @@
         'watch-history__filter': 'Фильтр «Истории»'
     };
     var HEAD_DEFAULT = ['notice--icon', 'black-friday__button'];
-    var HEAD_GENERIC = ['head__action', 'head__settings', 'selector', 'focus', 'hover', 'hide', 'online-parser-head-hidden'];
+    // Общие классы и состояния: колокольчик, например, получает active при
+    // новых уведомлениях и раз в 15 секунд animate для мигания
+    var HEAD_GENERIC = ['head__action', 'head__settings', 'selector', 'focus', 'hover', 'hide', 'active', 'animate',
+        'selected', 'visible', 'loading', 'disabled', 'online-parser-head-hidden'];
 
     function headKey(node) {
         var classes = String(node.className && node.className.baseVal !== undefined ? node.className.baseVal : node.className || '')
@@ -3995,6 +3998,16 @@
         var html = node.innerHTML || '', hash = 0;
         for (var i = 0; i < html.length; i++) hash = (hash * 31 + html.charCodeAt(i)) | 0;
         return 'html ' + (hash >>> 0).toString(36);
+    }
+
+    // Скрытый ключ из классов совпадает, если все его классы есть у значка:
+    // так лишний класс состояния, которого нет в списке выше, не вернёт
+    // значок на экран
+    function headMatch(key, node) {
+        if (/^(icon|text|html) /.test(key)) return headKey(node) === key;
+
+        var classes = ' ' + String(node.className || '') + ' ';
+        return key.split(' ').every(function (c) { return classes.indexOf(' ' + c + ' ') >= 0; });
     }
 
     function headName(key, node) {
@@ -4027,7 +4040,7 @@
         var hidden = headHidden();
 
         headItems().forEach(function (node) {
-            var hide = hidden.indexOf(headKey(node)) >= 0;
+            var hide = hidden.some(function (key) { return headMatch(key, node); });
             if (node.classList.contains('online-parser-head-hidden') !== hide) node.classList.toggle('online-parser-head-hidden', hide);
         });
     }
@@ -4052,9 +4065,11 @@
 
         headItems().forEach(function (node) {
             var key = headKey(node);
+            var match = hidden.filter(function (h) { return headMatch(h, node); })[0];
+            if (match) key = match;
             if (seen[key]) return;
             seen[key] = true;
-            items.push({ title: headName(key, node), key: key, checkbox: true, checked: hidden.indexOf(key) >= 0 });
+            items.push({ title: headName(key, node), key: key, checkbox: true, checked: !!match });
         });
 
         // Скрытые, которых сейчас в шапке нет (промо кончилось, значок
